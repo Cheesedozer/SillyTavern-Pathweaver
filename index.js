@@ -108,7 +108,7 @@
         openai_preset: 'custom',
         openai_key: '',
         suggestions_count: 6,
-        context_depth: 4,
+        context_depth: 8,
         bar_minimized: false,
         insert_mode: false,
         insert_type_enabled: false,
@@ -139,11 +139,11 @@
     let actionBar = null;
     let suggestionsModal = null;
     let settingsModal = null;
-    let editorModal = null;
     let abortController = null;
     let isGenerating = false;
     let promptCache = {};
-    let currentCategory = 'context';
+    let barResizeObserver = null;
+    let pendingMainApiRequest = null; // Main API request still running after a cancel
     let directorMode = 'single_scene'; // 'single_scene' or 'story_beats'
 
     // Suggestion cache
@@ -184,6 +184,8 @@
     }
 
     function saveSettings() {
+        // Most settings (length, voice, context) change what a suggestion looks like
+        cachedSuggestions = {};
         const { saveSettingsDebounced } = SillyTavern.getContext();
         saveSettingsDebounced();
     }
@@ -224,41 +226,21 @@
         return categories;
     }
 
-    // Helper to get just the main bar buttons (Main + Custom)
-    function getBarButtons() {
-        const buttons = { ...MAIN_CATEGORIES };
-
-        // Inject customs after character, before explicit? Or just append.
-        // Let's just append custom styles to the main list logic.
-        // But we return them as a separate list for the UI builder loop
-        return buttons;
-    }
-
-    function getVisibleCategories() {
-        const all = getAllCategories();
-        const visible = {};
-
-        for (const [key, cat] of Object.entries(all)) {
-            if (cat.nsfw && !settings.show_explicit) continue;
-            visible[key] = cat;
-        }
-
-        return visible;
-    }
-
     // ============================================================
     // CONNECTION PROFILE UTILITIES (from EchoChamber pattern)
     // ============================================================
 
     /** Escape string for safe use in HTML attributes and text (e.g. profile names with quotes) */
     function escapeHtmlAttr(str) {
-        if (str == null || typeof str !== 'string') return '';
-        return str
+        if (str == null) return '';
+        return String(str)
             .replace(/&/g, '&amp;')
             .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;')
             .replace(/</g, '&lt;')
             .replace(/>/g, '&gt;');
     }
+    const esc = escapeHtmlAttr;
 
     function getConnectionProfiles() {
         try {
@@ -343,493 +325,474 @@
     // PROMPT LOADING
     // ============================================================
 
+    const FALLBACK_STYLE_PROMPT = 'STYLE: General\nSuggest what could happen next in the story, grounded in the current scene.';
+
+    async function fetchPromptFile(name) {
+        try {
+            const response = await fetch(`${BASE_URL}/prompts/${name}.md?v=${Date.now()}`);
+            if (!response.ok) return null;
+            return await response.text();
+        } catch (err) {
+            warn(`Failed to load prompt file ${name}.md:`, err);
+            return null;
+        }
+    }
+
+    /** Returns the style-specific part of the system prompt for a category. */
     async function loadPrompt(category) {
         if (promptCache[category]) {
             return promptCache[category];
         }
 
-        // Check for user customization of built-in style
+        // User customization of a built-in style
         if (settings.builtin_customizations?.[category]) {
             promptCache[category] = settings.builtin_customizations[category];
-            return settings.builtin_customizations[category];
+            return promptCache[category];
         }
 
         const customStyle = settings.custom_styles?.find(s => s.id === category);
-        if (customStyle) {
-            const prompt = (customStyle.prompt && String(customStyle.prompt).trim()) ? customStyle.prompt : null;
-            if (prompt) {
-                promptCache[category] = prompt;
-                return prompt;
-            }
-            warn(`Custom style "${category}" has no prompt; using template.`);
-            try {
-                const templateResp = await fetch(`${BASE_URL}/prompts/template.md?v=${Date.now()}`);
-                const fallback = templateResp.ok ? await templateResp.text() : 'Generate story suggestions.';
-                promptCache[category] = fallback;
-                return fallback;
-            } catch (_) {
-                promptCache[category] = 'Generate story suggestions.';
-                return 'Generate story suggestions.';
-            }
+        if (customStyle && customStyle.prompt && String(customStyle.prompt).trim()) {
+            promptCache[category] = customStyle.prompt;
+            return customStyle.prompt;
         }
+        if (customStyle) warn(`Custom style "${category}" has no prompt; using template.`);
 
-        try {
-            const response = await fetch(`${BASE_URL}/prompts/${category}.md?v=${Date.now()}`);
-            if (!response.ok) throw new Error('Failed to load prompt');
-            const prompt = await response.text();
-            promptCache[category] = prompt;
-            return prompt;
-        } catch (err) {
-            warn(`Failed to load prompt for ${category}:`, err);
-            const templateResp = await fetch(`${BASE_URL}/prompts/template.md?v=${Date.now()}`);
-            return templateResp.ok ? await templateResp.text() : 'Generate story suggestions.';
-        }
+        const prompt = (!customStyle && await fetchPromptFile(category))
+            || await fetchPromptFile('template')
+            || FALLBACK_STYLE_PROMPT;
+        promptCache[category] = prompt;
+        return prompt;
     }
 
-    async function loadTemplatePrompt() {
+    // ============================================================
+    // PROMPT BUILDING
+    // ============================================================
+
+    /** Replace {{char}}/{{user}} (and other ST macros when available) in a prompt. */
+    function substituteMacros(text, storyContext) {
+        if (!text) return '';
+        let out = String(text);
         try {
-            const response = await fetch(`${BASE_URL}/prompts/template.md?v=${Date.now()}`);
-            if (!response.ok) throw new Error('Failed');
-            return await response.text();
-        } catch {
-            return `You are a creative writing assistant generating story direction suggestions.
-
-TASK: Generate distinct suggestions for what could happen next in the narrative.
-
-OUTPUT FORMAT:
-[EMOJI] TITLE
-DESCRIPTION
-
----
-
-GUIDELINES:
-- Each suggestion should be distinct and creative
-- Keep titles punchy and evocative (under 8 words)
-- Match the tone and genre of the ongoing story
-- Do NOT include numbering or preamble`;
+            const { substituteParams } = SillyTavern.getContext();
+            if (typeof substituteParams === 'function') {
+                out = substituteParams(out, storyContext.userName, storyContext.charName);
+            }
+        } catch (err) {
+            warn('substituteParams failed:', err);
         }
+        return out
+            .replace(/{{char}}/gi, storyContext.charName)
+            .replace(/{{user}}/gi, storyContext.userName)
+            .replace(/{{model}}/gi, storyContext.charName);
+    }
+
+    /**
+     * Suggestions are sent as the user's own message. When the user wraps them
+     * in [OOC: ] or [Director: ], they are instructions to the storyteller;
+     * otherwise they are written as the user's character's next message.
+     */
+    function getSuggestionVoice() {
+        return settings.insert_type_enabled && (settings.insert_type_ooc || settings.insert_type_director)
+            ? 'narrative'
+            : 'character';
+    }
+
+    function getVoiceRule() {
+        if (getSuggestionVoice() === 'narrative') {
+            return 'Write each description as a direction to the storyteller about what should happen next, in plain third-person present tense (for example: "The guard notices the forged seal and blocks the gate."). It will be sent as an out-of-character instruction, so describe events and choices, not finished prose.';
+        }
+        return 'Write each description as {{user}}\'s next message: what {{user}} does, says, or notices, matching the person, tense, and style {{user}} has been using in their own messages. {{user}} may narrate small things around them to set up the idea (a sound, an arrival, something they find), but must not decide what other established characters say, feel, or choose.';
+    }
+
+    function getLengthRule() {
+        return settings.suggestion_length === 'long'
+            ? 'Each description is 4-6 sentences.'
+            : 'Each description is 2-3 sentences.';
+    }
+
+    function buildSuggestionSystemPrompt(stylePrompt, storyContext) {
+        const prompt = `You write suggestions for what could happen next in an ongoing roleplay story between {{user}} (the user) and {{char}}. {{user}} will choose one suggestion and send its description as their next message.
+
+${stylePrompt.trim()}
+
+RULES:
+- Continue from the exact moment the last message ends. Each suggestion is a plausible next beat from there, not a later scene or a summary of a whole arc.
+- Anchor every suggestion in something specific from the recent messages: a person, object, place, line of dialogue, or unfinished action.
+- Stay consistent with established facts, the characters' personalities and relationships, the setting, and the story's current tone. Only use world details that appear in the provided context.
+- Make the suggestions clearly different from each other: vary who acts, what changes, and where the scene goes. Never write several versions of the same idea.
+- Use plain, specific language. Prefer a concrete action or an actual line of dialogue over mood, atmosphere, or abstract summary.
+- ${getVoiceRule()}
+
+OUTPUT FORMAT (follow exactly):
+<one emoji> <title in plain text, under 8 words>
+<description>
+---
+Put a line containing only --- between suggestions. No numbering, markdown, preamble, or closing remarks.`;
+        return substituteMacros(prompt, storyContext);
+    }
+
+    function buildSurpriseSystemPrompt(stylePrompt, storyContext) {
+        const prompt = `You secretly plan one upcoming development for an ongoing roleplay story between {{user}} (the user) and {{char}}. It will be given to the storytelling AI as a hidden instruction a few messages from now; the user will not see it in advance.
+
+${stylePrompt.trim()}
+
+RULES:
+- It will be used a few messages from now, so tie it to something that will still matter then (a character, place, object, goal, or unresolved thread) rather than to the exact current moment.
+- Stay consistent with established facts, the characters, the setting, and the story's tone. Only use world details that appear in the provided context.
+- Be specific and concrete: say what happens, not what mood it should create.
+- Tell the storyteller what to introduce. Do not write story prose and do not script {{user}}'s actions.
+
+OUTPUT FORMAT: exactly one line and nothing else:
+[System Note: <1-3 sentences>]`;
+        return substituteMacros(prompt, storyContext);
+    }
+
+    function buildContextBlock(storyContext, { includeWorldInfo = true } = {}) {
+        const { charName, userName } = storyContext;
+        const parts = [];
+        parts.push(`Characters: ${charName} (played by the AI); ${userName} (the user's character).`);
+        if (settings.include_description && storyContext.description) {
+            parts.push(`${charName}'s description:\n${storyContext.description.substring(0, 10000)}`);
+        }
+        if (storyContext.persona) {
+            parts.push(`${userName}'s persona:\n${storyContext.persona.substring(0, 4000)}`);
+        }
+        if (settings.include_scenario && storyContext.scenario) {
+            parts.push(`Scenario:\n${storyContext.scenario.substring(0, 4000)}`);
+        }
+        if (includeWorldInfo && storyContext.worldInfo) {
+            parts.push(`World lore relevant to the recent messages:\n${storyContext.worldInfo.substring(0, 10000)}`);
+        }
+        parts.push(`Recent messages, oldest first. The last message is where the scene stands now:\n${storyContext.history}`);
+        return parts.join('\n\n');
     }
 
     // ============================================================
     // CONTEXT EXTRACTION
     // ============================================================
 
-    function extractContext() {
+    const REASONING_TAGS = 'thought|think|thinking|reasoning|reason';
+
+    /** Remove reasoning/thinking blocks, including unclosed or orphaned tags. */
+    function stripReasoning(text) {
+        if (!text) return '';
+        let out = String(text)
+            .replace(new RegExp(`<(${REASONING_TAGS})\\b[^>]*>[\\s\\S]*?<\\/\\1>`, 'gi'), '');
+        // A closing tag with no opening tag: everything before it was reasoning
+        const orphanClose = out.search(new RegExp(`<\\/(${REASONING_TAGS})>`, 'i'));
+        if (orphanClose !== -1) out = out.slice(out.indexOf('>', orphanClose) + 1);
+        // An opening tag with no closing tag: reasoning is unfinished or truncated
+        out = out.replace(new RegExp(`<(${REASONING_TAGS})\\b[^>]*>[\\s\\S]*$`, 'i'), '');
+        return out.replace(new RegExp(`<\\/?(${REASONING_TAGS})\\s*\\/?>`, 'gi'), '').trim();
+    }
+
+    function getCharacterNames(stContext) {
+        if (stContext.groupId && Array.isArray(stContext.groups)) {
+            const group = stContext.groups.find(g => g.id === stContext.groupId);
+            const names = (group?.members || [])
+                .map(avatar => stContext.characters?.find(c => c.avatar === avatar)?.name)
+                .filter(Boolean);
+            if (names.length) return names.join(', ');
+        }
+        const char = stContext.characters?.[stContext.characterId];
+        return char?.name || stContext.name2 || 'Character';
+    }
+
+    function getCardFields(stContext) {
+        try {
+            if (typeof stContext.getCharacterCardFields === 'function') {
+                return stContext.getCharacterCardFields() || {};
+            }
+        } catch (err) {
+            warn('getCharacterCardFields failed:', err);
+        }
+        const char = stContext.characters?.[stContext.characterId];
+        return {
+            description: char?.data?.description || char?.description || '',
+            scenario: char?.data?.scenario || char?.scenario || '',
+            persona: '',
+        };
+    }
+
+    /** World Info entries SillyTavern would activate for the recent messages (dry run). */
+    async function getActivatedWorldInfo(stContext, visibleChat) {
+        if (typeof stContext.getWorldInfoPrompt !== 'function') return '';
+        try {
+            const scanChat = visibleChat.map(m => `${m.name}: ${m.mes}`).reverse();
+            const result = await stContext.getWorldInfoPrompt(scanChat, Number(stContext.maxContext) || 8192, true);
+            return (result?.worldInfoString || '').trim();
+        } catch (err) {
+            warn('Failed to get World Info:', err);
+            return '';
+        }
+    }
+
+    async function extractContext({ includeWorldInfo = settings.include_worldinfo } = {}) {
         const stContext = SillyTavern.getContext();
-        const context = stContext;
         const chat = stContext?.chat;
 
         if (!chat || chat.length === 0) return null;
 
-        // Helper to strip reasoning/thinking tags from text
-        const stripReasoningTags = (text) => {
-            if (!text) return '';
-            return text
-                .replace(/<(thought|think|thinking|reasoning|reason)>[\s\S]*?<\/\1>/gi, '')
-                .replace(/<(thought|think|thinking|reasoning|reason)\/>/gi, '')
-                .replace(/<(thought|think|thinking|reasoning|reason)\s*\/>/gi, '')
-                .trim();
-        };
-
         const cleanMessage = (text) => {
             if (!text) return '';
-            let cleaned = stripReasoningTags(text);
-            cleaned = cleaned.replace(/<[^>]*>/g, '');
+            const cleaned = stripReasoning(text).replace(/<[^>]*>/g, '');
             const txt = document.createElement('textarea');
             txt.innerHTML = cleaned;
-            return txt.value.substring(0, 10000);
+            return txt.value.trim().substring(0, 10000);
         };
 
-        const depth = Math.max(2, Math.min(10, settings.context_depth || 4));
-        const recentMessages = chat.slice(-depth);
+        // Hidden messages and system notices are not part of the story
+        const visibleChat = chat.filter(msg => msg && !msg.is_system && typeof msg.mes === 'string' && msg.mes.trim());
+        if (visibleChat.length === 0) return null;
 
-        const history = recentMessages.map(msg =>
-            `${msg.name}: ${cleanMessage(msg.mes)}`
-        ).join('\n\n');
+        const depth = Math.max(2, Math.min(20, Number(settings.context_depth) || 8));
+        const recentMessages = visibleChat.slice(-depth);
 
-        let characterInfo = '';
-        let scenario = '';
-        let description = '';
-        let worldInfo = '';
+        const history = recentMessages
+            .map(msg => `${msg.name}: ${cleanMessage(msg.mes)}`)
+            .join('\n\n');
 
-        if (stContext.characterId !== undefined && stContext.characters && stContext.characters[stContext.characterId]) {
-            const char = stContext.characters[stContext.characterId];
-            characterInfo = `Character: ${char.name || 'Unknown'}`;
-
-            if (char.data?.scenario) scenario = char.data.scenario;
-            else if (char.scenario) scenario = char.scenario;
-
-            if (char.data?.description) description = char.data.description;
-            else if (char.description) description = char.description;
-        }
-
-        // Extract World Info / Lorebook entries with Order >= 250 filter
-        try {
-            const entries = [];
-            const MIN_ORDER = 250;
-
-            // Helper to process WI entries from various formats
-            const processEntries = (entryData) => {
-                if (!entryData) return;
-                const entryList = Array.isArray(entryData) ? entryData : Object.values(entryData);
-                for (const entry of entryList) {
-                    if (!entry) continue;
-                    const content = entry.content || entry.text || '';
-                    const isDisabled = entry.disable === true || entry.disabled === true;
-                    const order = entry.order ?? entry.insertion_order ?? 0;
-                    if (content && !isDisabled && order >= MIN_ORDER) {
-                        entries.push(content);
-                    }
-                }
-            };
-
-            // Method 1: Character's embedded lorebook (primary source)
-            if (stContext.characterId !== undefined && stContext.characters && stContext.characters[stContext.characterId]) {
-                const char = stContext.characters[stContext.characterId];
-                if (char.data?.character_book?.entries) processEntries(char.data.character_book.entries);
-                if (entries.length === 0 && char.character_book?.entries) processEntries(char.character_book.entries);
-            }
-
-            // Method 2: Global window.world_info
-            if (entries.length === 0 && typeof window.world_info !== 'undefined' && window.world_info) {
-                processEntries(window.world_info);
-                if (window.world_info.entries) processEntries(window.world_info.entries);
-            }
-
-            // Method 3: window.world_info_data
-            if (entries.length === 0 && window.world_info_data?.entries) processEntries(window.world_info_data.entries);
-
-            // Method 4: chatMetadata.worldInfo
-            if (entries.length === 0 && stContext.chatMetadata?.worldInfo) processEntries(stContext.chatMetadata.worldInfo);
-
-            if (entries.length > 0) worldInfo = entries.slice(0, 10).join('\n\n');
-        } catch (err) {
-            warn('Failed to extract World Info:', err);
-        }
+        const fields = getCardFields(stContext);
+        const worldInfo = includeWorldInfo ? await getActivatedWorldInfo(stContext, visibleChat.slice(-depth)) : '';
 
         return {
             history,
-            characterInfo,
-            scenario,
-            description,
+            charName: getCharacterNames(stContext),
+            userName: stContext.name1 || 'User',
+            description: fields.description || '',
+            scenario: fields.scenario || '',
+            persona: fields.persona || '',
             worldInfo,
-            messageCount: recentMessages.length,
-            chatId: stContext.chatId || Date.now()
+            chatId: stContext.chatId || stContext.groupId || null,
         };
     }
 
+    /** True while SillyTavern itself is generating a chat reply. */
+    function isHostGenerating() {
+        return document.body?.dataset?.generating === 'true';
+    }
+
+    function getSuggestionMaxTokens(count) {
+        const tokensPerSuggestion = settings.suggestion_length === 'long' ? 400 : 280;
+        const needed = count * tokensPerSuggestion + 800;
+        if (settings.reasoning_mode) {
+            // Reasoning models spend part of the budget on thinking
+            return Math.max(settings.max_output_tokens || 8192, needed);
+        }
+        return Math.min(8192, Math.max(2048, needed));
+    }
 
     // ============================================================
-    // GENERATION LOGIC (Pattern from EchoChamber)
+    // GENERATION
     // ============================================================
+
+    /**
+     * Send a system + user prompt to the configured source and return the raw text.
+     * For the default (Main API) source, the returned promise only settles when
+     * SillyTavern has actually finished the request, even if the signal was aborted.
+     */
+    async function requestCompletion({ systemPrompt, userPrompt, maxTokens, signal, temperature = 0.8 }) {
+        const stContext = SillyTavern.getContext();
+
+        if (settings.source === 'profile') {
+            const profile = getSelectedProfile(stContext);
+            const response = await stContext.ConnectionManagerRequestService.sendRequest(
+                profile.id,
+                [
+                    { role: 'system', content: systemPrompt },
+                    { role: 'user', content: userPrompt },
+                ],
+                maxTokens,
+                { stream: false, signal, extractData: true, includePreset: true, includeInstruct: true },
+            );
+            if (typeof response === 'string') return response;
+            if (typeof response?.content === 'string') return response.content;
+            if (response?.choices?.[0]?.message?.content) return response.choices[0].message.content;
+            return '';
+        }
+
+        if (settings.source === 'ollama') {
+            const baseUrl = (settings.ollama_url || 'http://localhost:11434').replace(/\/$/, '');
+            if (!settings.ollama_model) throw new Error('No Ollama model selected');
+            const response = await fetch(`${baseUrl}/api/generate`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    model: settings.ollama_model,
+                    system: systemPrompt,
+                    prompt: userPrompt,
+                    stream: false,
+                    options: { num_ctx: 8192, num_predict: maxTokens },
+                }),
+                signal,
+            });
+            if (!response.ok) throw new Error(`Ollama API error: ${response.status}`);
+            const data = await response.json();
+            return data.response || '';
+        }
+
+        if (settings.source === 'openai') {
+            const baseUrl = (settings.openai_url || 'http://localhost:1234/v1').replace(/\/$/, '');
+            const headers = { 'Content-Type': 'application/json' };
+            if (settings.openai_key) headers['Authorization'] = `Bearer ${settings.openai_key}`;
+            const response = await fetch(`${baseUrl}/chat/completions`, {
+                method: 'POST',
+                headers,
+                body: JSON.stringify({
+                    model: settings.openai_model || 'local-model',
+                    messages: [
+                        { role: 'system', content: systemPrompt },
+                        { role: 'user', content: userPrompt },
+                    ],
+                    temperature,
+                    max_tokens: maxTokens,
+                    stream: false,
+                }),
+                signal,
+            });
+            if (!response.ok) throw new Error(`API error: ${response.status}`);
+            const data = await response.json();
+            return data.choices?.[0]?.message?.content || '';
+        }
+
+        // Default: the main API through SillyTavern
+        const { generateRaw } = stContext;
+        if (!generateRaw) throw new Error('generateRaw not available in context');
+        if (isHostGenerating()) throw new Error('Wait for the current reply to finish, then try again.');
+        // SillyBunny honors `signal`; upstream SillyTavern ignores it and keeps
+        // generating. Settle right away on abort so the UI responds, but remember
+        // the request so nothing new is sent until it has really finished.
+        const request = generateRaw({ systemPrompt, prompt: userPrompt, responseLength: maxTokens, signal });
+        const pending = request.catch(() => {}).finally(() => {
+            if (pendingMainApiRequest === pending) pendingMainApiRequest = null;
+        });
+        pendingMainApiRequest = pending;
+        const aborted = new Promise((_, reject) => {
+            if (signal?.aborted) reject(new DOMException('Aborted', 'AbortError'));
+            signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true });
+        });
+        const result = await Promise.race([request, aborted]);
+        return result || '';
+    }
+
+    /** Resolves once any Main API request Pathweaver started has finished. */
+    function waitForMainApiRequest() {
+        return pendingMainApiRequest || Promise.resolve();
+    }
+
+    function getSelectedProfile(stContext) {
+        if (!settings.preset || !String(settings.preset).trim()) {
+            throw new Error('Please select a connection profile');
+        }
+        const profile = stContext.extensionSettings?.connectionManager?.profiles?.find(p => p.name === settings.preset);
+        if (!profile) throw new Error(`Profile '${settings.preset}' not found`);
+        if (!stContext.ConnectionManagerRequestService) throw new Error('ConnectionManagerRequestService not available');
+        return profile;
+    }
+
+    function buildSuggestionTask(category, customDirections, mode) {
+        const count = settings.suggestions_count;
+        if (category === 'director' && customDirections?.length) {
+            const dirList = customDirections.map((d, i) => `${i + 1}. ${d}`).join('\n');
+            if (mode === 'story_beats') {
+                return {
+                    count: customDirections.length,
+                    task: `Write exactly ${customDirections.length} suggestions, one for each of the user's directions below, in the same order. Each suggestion carries out only its own direction; do not mix in events from the other directions.\n\nDIRECTIONS:\n${dirList}\n\n${getLengthRule()}`,
+                };
+            }
+            return {
+                count,
+                task: `The user's directions for the next scene, in order:\n${dirList}\n\nWrite exactly ${count} different versions of this scene. Every version includes all of the directions in this order, but each one handles them differently (pacing, emphasis, how the characters react).\n\n${getLengthRule()}`,
+            };
+        }
+        return {
+            count,
+            task: `Write exactly ${count} suggestions. ${getLengthRule()}`,
+        };
+    }
 
     async function generateSuggestions(category, forceRefresh = false, customDirections = null, mode = 'single_scene', outputContainer = null) {
         log('Generating suggestions for:', category);
+
+        if (isGenerating) {
+            showToast('Pathweaver is still finishing the previous request.', 'warning');
+            return;
+        }
+
         const stContext = SillyTavern.getContext();
-        const context = stContext;
+        const chatId = stContext?.chatId || stContext?.groupId || null;
 
-        if (!stContext) {
-            error('SillyTavern context not available');
-            return;
-        }
-
-        const storyContext = extractContext();
-        if (!storyContext) {
-            showEmptyState('Start a conversation to get suggestions', outputContainer);
-            return;
-        }
-
-        // Only cache if NOT director mode (director is always dynamic)
+        // Director results are never cached
         if (category !== 'director') {
-            if (cachedChatId !== storyContext.chatId) {
+            if (cachedChatId !== chatId) {
                 cachedSuggestions = {};
-                cachedChatId = storyContext.chatId;
+                cachedChatId = chatId;
             }
-
             if (!forceRefresh && cachedSuggestions[category]) {
                 displaySuggestions(cachedSuggestions[category], category, outputContainer);
                 return;
             }
         }
 
-        if (isGenerating) return;
         isGenerating = true;
-        currentCategory = category;
-
-        // Determine loading message
-        let loadingMsg = 'Generating Suggestions...';
-
-        showLoadingState(category, outputContainer, loadingMsg);
+        showLoadingState(category, outputContainer, 'Generating Suggestions...');
         abortController = new AbortController();
+        const signal = abortController.signal;
 
         try {
-            let categoryPrompt = await loadPrompt(category);
-
-            // Perform macro substitution ({{user}}, {{char}})
-            const charName = storyContext.characterInfo.replace('Character: ', '') || 'Character';
-            const userName = stContext.name1 || 'User';
-
-            categoryPrompt = categoryPrompt
-                .replace(/{{char}}/g, charName)
-                .replace(/{{user}}/g, userName)
-                .replace(/{{model}}/g, charName); // some prompts use model as char alias
-
-            let contextBlock = '';
-
-            if (storyContext.characterInfo) contextBlock += `${storyContext.characterInfo}\n\n`;
-            if (settings.include_scenario && storyContext.scenario) contextBlock += `Scenario: ${storyContext.scenario}\n\n`;
-            if (settings.include_description && storyContext.description) {
-                contextBlock += `Character Description: ${storyContext.description.substring(0, 10000)}\n\n`;
-            }
-            if (settings.include_worldinfo && storyContext.worldInfo) {
-                contextBlock += `World Lore:\n${storyContext.worldInfo.substring(0, 10000)}\n\n`;
-            }
-            contextBlock += `Recent conversation:\n${storyContext.history}`;
-
-            let userPrompt = '';
-            let calculatedMaxTokens = 0;
-
-            // Calculate base tokens needed for suggestions
-            const tokensPerSuggestion = settings.suggestion_length === 'long' ? 400 : 280;
-            const baseTokensNeeded = settings.suggestions_count * tokensPerSuggestion + 800;
-
-            if (settings.reasoning_mode) {
-                // Reasoning mode: use configurable max_output_tokens, but ensure it's at least enough for suggestions
-                // Reasoning models need more tokens for their thinking process
-                calculatedMaxTokens = Math.max(settings.max_output_tokens || 8192, baseTokensNeeded);
-                log(`Reasoning mode enabled. Using max_tokens: ${calculatedMaxTokens} (config: ${settings.max_output_tokens})`);
-            } else {
-                // Normal mode: use the original formula with reasonable bounds
-                calculatedMaxTokens = Math.min(8192, Math.max(2048, baseTokensNeeded));
+            const storyContext = await extractContext();
+            if (!storyContext) {
+                showEmptyState('Start a conversation to get suggestions', outputContainer);
+                return;
             }
 
-            if (category === 'director' && customDirections?.length) {
-                if (mode === 'story_beats') {
-                    // Story Beats: 1 input = 1 suggestion (Classic behavior)
-                    const dirList = customDirections.map((d, i) => `${i + 1}. ${d}`).join('\n');
-                    userPrompt = `[STORY CONTEXT]\n${contextBlock}\n\n[TASK]\nGenerate exactly ${customDirections.length} suggestions, one for each of the following directions.\n\nUSER DIRECTIONS:\n${dirList}\n\nFORMAT:\n[EMOJI] TITLE\nDESCRIPTION\n\nGUIDELINES:\n- PREVENT BLEED: Each suggestion must be strictly isolated to its corresponding input beat. Do NOT combine events from different beats unless explicitly requested.\n- Follow the specific direction for each suggestion EXACTLY.\n- Keep titles punchy and plain text (no asterisks).\n- ${settings.suggestion_length === 'long' ? 'Write 4-6 sentences per suggestion.' : 'Write 2-3 sentences per suggestion.'}\n- Do NOT include any preamble.${settings.stream_suggestions ? '\n\nSTREAMING: Output one complete suggestion at a time. Each suggestion MUST start with [EMOJI] TITLE then DESCRIPTION; end each with --- before the next. Do NOT repeat a title or copy content from one suggestion into another. Every suggestion is independent and self-contained.' : ''}`;
-                    // Recalculate for director mode with custom directions
-                    const dirTokensNeeded = customDirections.length * tokensPerSuggestion + 800;
-                    if (settings.reasoning_mode) {
-                        calculatedMaxTokens = Math.max(settings.max_output_tokens || 8192, dirTokensNeeded);
-                    } else {
-                        calculatedMaxTokens = Math.min(8192, Math.max(2048, dirTokensNeeded));
-                    }
-                } else {
-                    // Single Scene: Combined inputs = N suggestions (New behavior)
-                    const combinedDirections = customDirections.join(' ');
-                    const lengthInstruction = settings.suggestion_length === 'long'
-                        ? 'Each description should be 4-6 sentences, providing rich detail and context.'
-                        : 'Each description should be 2-3 sentences, concise but evocative.';
+            const stylePrompt = await loadPrompt(category);
+            const systemPrompt = buildSuggestionSystemPrompt(stylePrompt, storyContext);
+            const { count, task } = buildSuggestionTask(category, customDirections, mode);
+            const userPrompt = `[STORY CONTEXT]\n${buildContextBlock(storyContext)}\n\n[TASK]\n${task}`;
+            const maxTokens = getSuggestionMaxTokens(count);
+            log(`Max tokens: ${maxTokens}`);
 
-                    userPrompt = `[STORY CONTEXT]\n${contextBlock}\n\n[TASK]\nThe user has provided the following direction/scenario for the next scene:\n"${combinedDirections}"\n\nBased on this direction, generate exactly ${settings.suggestions_count} DISTINCT options or variations for how this scene could play out.\n${lengthInstruction}\n\nFORMAT:\n[EMOJI] TITLE\nDESCRIPTION\n\nGUIDELINES:\n- All suggestions must follow the user's direction but offer different execution/flavor.\n- Keep titles punchy and plain text.\n- Do NOT include any preamble.${settings.stream_suggestions ? '\n\nSTREAMING: Output one complete suggestion at a time. Each suggestion MUST start with [EMOJI] TITLE then DESCRIPTION; end each with --- before the next. Do NOT repeat a title or copy content from one suggestion into another. Every suggestion is independent and self-contained.' : ''}`;
-                    // Recalculate for director single scene mode
-                    if (settings.reasoning_mode) {
-                        calculatedMaxTokens = Math.max(settings.max_output_tokens || 8192, baseTokensNeeded);
-                    } else {
-                        calculatedMaxTokens = Math.min(8192, Math.max(2048, baseTokensNeeded));
-                    }
-                }
-            } else {
-                const lengthInstruction = settings.suggestion_length === 'long'
-                    ? 'Each description should be 4-6 sentences, providing rich detail and context.'
-                    : 'Each description should be 2-3 sentences, concise but evocative.';
+            if (settings.source === 'profile') getSelectedProfile(stContext);
 
-                userPrompt = `[STORY CONTEXT]\n${contextBlock}\n\n[TASK]\nGenerate exactly ${settings.suggestions_count} distinct suggestions.\n${lengthInstruction}\nFollow the format specified in the system instructions exactly.\nIMPORTANT: Use PLAIN TEXT for titles - do NOT wrap titles in **asterisks**.\nDo NOT include any preamble.${settings.stream_suggestions ? '\n\nSTREAMING: Output one complete suggestion at a time. Each suggestion MUST start with [EMOJI] TITLE then DESCRIPTION; end each with --- before the next. Do NOT repeat a title or copy content from one suggestion into another. Every suggestion is independent and self-contained.' : ''}`;
-                // Use the pre-calculated baseTokensNeeded (already calculated above)
-                if (settings.reasoning_mode) {
-                    calculatedMaxTokens = Math.max(settings.max_output_tokens || 8192, baseTokensNeeded);
-                } else {
-                    calculatedMaxTokens = Math.min(8192, Math.max(2048, baseTokensNeeded));
-                }
-            }
-
-            let result = '';
-            log(`Calculated Max Tokens: ${calculatedMaxTokens}`);
-
-            // Fail fast: avoid silently falling back to default API when profile is selected but none chosen
-            if (settings.source === 'profile') {
-                if (!settings.preset || !String(settings.preset).trim()) {
-                    throw new Error('Please select a connection profile');
-                }
-            }
-
-            // Streaming path: Ollama & OpenAI always; Profile & Default try stream then fallback to non-streaming
-            if (settings.stream_suggestions) {
-                if (settings.source === 'ollama' || settings.source === 'openai') {
-                    try {
-                        await runStreamingGeneration({
-                            source: settings.source,
-                            categoryPrompt,
-                            userPrompt,
-                            calculatedMaxTokens,
-                            category,
-                            outputContainer,
-                            abortController
-                        });
-                    } catch (err) {
-                        if (err.name === 'AbortError' || (abortController && abortController.signal.aborted)) {
-                            showEmptyState('Generation cancelled by user', outputContainer);
-                        } else {
-                            error('Streaming generation failed:', err);
-                            showErrorState(err.message || 'API request failed', outputContainer);
-                        }
-                    } finally {
-                        isGenerating = false;
-                        abortController = null;
-                    }
+            if (settings.stream_suggestions && STREAMING_SOURCES.includes(settings.source)) {
+                try {
+                    await runStreamingGeneration({
+                        source: settings.source,
+                        systemPrompt,
+                        userPrompt,
+                        maxTokens,
+                        category,
+                        outputContainer,
+                        signal,
+                        maxSuggestions: count,
+                    });
                     return;
-                }
-                if (settings.source === 'profile' || settings.source === 'default') {
-                    let streamSucceeded = false;
-                    try {
-                        await runStreamingGeneration({
-                            source: settings.source,
-                            categoryPrompt,
-                            userPrompt,
-                            calculatedMaxTokens,
-                            category,
-                            outputContainer,
-                            abortController
-                        });
-                        streamSucceeded = true;
-                    } catch (err) {
-                        if (err.name === 'AbortError' || (abortController && abortController.signal.aborted)) {
-                            showEmptyState('Generation cancelled by user', outputContainer);
-                            isGenerating = false;
-                            abortController = null;
-                            return;
-                        }
-                        console.log(STREAM_LOG, 'Fallback to non-streaming:', err?.message || String(err));
-                        console.log(STREAM_LOG, 'Stack:', err?.stack);
-                    }
-                    if (streamSucceeded) {
-                        isGenerating = false;
-                        abortController = null;
-                        return;
-                    }
-                    // Fall through to non-streaming path below
+                } catch (err) {
+                    // Connection profiles don't all support streaming; retry without it
+                    if (err.name === 'AbortError' || signal.aborted || settings.source !== 'profile') throw err;
+                    streamLog('Streaming failed, falling back to non-streaming:', err?.message || String(err));
+                    showLoadingState(category, outputContainer, 'Generating Suggestions...');
                 }
             }
 
-            if (settings.source === 'profile' && settings.preset) {
-                const cm = stContext.extensionSettings?.connectionManager;
-                const profile = cm?.profiles?.find(p => p.name === settings.preset);
-                if (!profile) throw new Error(`Profile '${settings.preset}' not found`);
+            const result = await requestCompletion({ systemPrompt, userPrompt, maxTokens, signal });
+            if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
 
-                if (!stContext.ConnectionManagerRequestService) throw new Error('ConnectionManagerRequestService not available');
-
-                const messages = [
-                    { role: 'system', content: categoryPrompt },
-                    { role: 'user', content: userPrompt }
-                ];
-
-                log(`Generating with profile: ${profile.name}`);
-                const response = await stContext.ConnectionManagerRequestService.sendRequest(
-                    profile.id,
-                    messages,
-                    calculatedMaxTokens,
-                    {
-                        stream: false,
-                        signal: abortController.signal,
-                        extractData: true,
-                        includePreset: true,
-                        includeInstruct: true
-                    }
-                );
-
-                if (response?.content) result = response.content;
-                else if (typeof response === 'string') result = response;
-                else if (response?.choices?.[0]?.message?.content) result = response.choices[0].message.content;
-                else result = JSON.stringify(response);
-
-            } else if (settings.source === 'ollama') {
-                const baseUrl = (settings.ollama_url || 'http://localhost:11434').replace(/\/$/, '');
-                if (!settings.ollama_model) throw new Error('No Ollama model selected');
-
-                log(`Generating with Ollama: ${settings.ollama_model}`);
-                const response = await fetch(`${baseUrl}/api/generate`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        model: settings.ollama_model,
-                        system: categoryPrompt,
-                        prompt: userPrompt,
-                        stream: false,
-                        options: { num_ctx: 8192, num_predict: calculatedMaxTokens }
-                    }),
-                    signal: abortController.signal
-                });
-
-                if (!response.ok) throw new Error(`Ollama API error: ${response.status}`);
-                const data = await response.json();
-                result = data.response || '';
-
-            } else if (settings.source === 'openai') {
-                const baseUrl = (settings.openai_url || 'http://localhost:1234/v1').replace(/\/$/, '');
-                log(`Generating with OpenAI-compatible: ${baseUrl}`);
-
-                const headers = { 'Content-Type': 'application/json' };
-                if (settings.openai_key) {
-                    headers['Authorization'] = `Bearer ${settings.openai_key}`;
-                }
-
-                const response = await fetch(`${baseUrl}/chat/completions`, {
-                    method: 'POST',
-                    headers: headers,
-                    body: JSON.stringify({
-                        model: settings.openai_model || 'local-model',
-                        messages: [
-                            { role: 'system', content: categoryPrompt },
-                            { role: 'user', content: userPrompt }
-                        ],
-                        temperature: 0.8,
-                        max_tokens: calculatedMaxTokens,
-                        stream: false
-                    }),
-                    signal: abortController.signal
-                });
-
-                if (!response.ok) throw new Error(`API error: ${response.status}`);
-                const data = await response.json();
-                result = data.choices?.[0]?.message?.content || '';
-
-            } else {
-                const { generateRaw } = stContext;
-                if (!generateRaw) throw new Error('generateRaw not available in context');
-
-                log('Generating with default ST API');
-
-                // Create a promise that rejects when aborted
-                const abortPromise = new Promise((_, reject) => {
-                    abortController.signal.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')));
-                });
-
-                // Race the generation against the abort signal
-                result = await Promise.race([
-                    generateRaw({ systemPrompt: categoryPrompt, prompt: userPrompt, streaming: false }),
-                    abortPromise
-                ]);
-            }
-
-            if (abortController.signal.aborted) {
-                throw new DOMException('Aborted', 'AbortError');
-            }
-
-            const suggestions = await parseSuggestions(result);
-            if (category !== 'director') cachedSuggestions[category] = suggestions;
+            const suggestions = await parseSuggestions(result, count);
+            if (category !== 'director' && suggestions.length) cachedSuggestions[category] = suggestions;
             displaySuggestions(suggestions, category, outputContainer);
-
         } catch (err) {
-            if (err.name === 'AbortError' || (abortController && abortController.signal.aborted)) {
+            if (err.name === 'AbortError' || signal.aborted) {
                 showEmptyState('Generation cancelled by user', outputContainer);
             } else {
                 error('Generation failed:', err);
                 showErrorState(err.message || 'API request failed', outputContainer);
             }
         } finally {
-            isGenerating = false;
             abortController = null;
+            await waitForMainApiRequest();
+            isGenerating = false;
         }
     }
 
@@ -837,213 +800,130 @@ GUIDELINES:
     // RESPONSE PARSING - Robust multi-strategy parser
     // ============================================================
 
-    async function parseSuggestions(text) {
+    const EMOJI_PATTERN = '[\\u{1F000}-\\u{1F02B}\\u{1F0A0}-\\u{1F0FF}\\u{1F100}-\\u{1F1FF}\\u{1F300}-\\u{1F9FF}\\u{2600}-\\u{26FF}\\u{2700}-\\u{27BF}\\u{1F600}-\\u{1F64F}\\u{1F680}-\\u{1F6FF}\\u{2300}-\\u{23FF}\\u{2B00}-\\u{2BFF}\\u{2B50}\\u{1FA00}-\\u{1FAFF}]';
+    const emojiRegex = new RegExp(EMOJI_PATTERN, 'u');
+    const emojiRegexGlobal = new RegExp(EMOJI_PATTERN, 'gu');
+    const EMOJI_SEQUENCE_REGEX = new RegExp(`^${EMOJI_PATTERN}(?:\\uFE0F|[\\u{1F3FB}-\\u{1F3FF}]|\\u200D${EMOJI_PATTERN}\\uFE0F?)*`, 'u');
+    const BLOCK_SEPARATOR = /\n\s*---+\s*\n|\n\s*---+\s*$|^\s*---+\s*\n/;
+
+    async function parseSuggestions(text, maxCount = settings.suggestions_count) {
         // Yield to UI thread to prevent blocking during parsing
         await new Promise(resolve => setTimeout(resolve, 0));
 
-        if (!text) return [];
+        const cleanedText = stripReasoning(text);
+        if (!cleanedText) return [];
 
-        // First, strip any reasoning/thinking tags from the entire response
-        // Handles both XML-style (DeepSeek, etc.) and HTML-style tags
-        let cleanedText = text
-            // XML-style reasoning tags: <think>, </think>, <thinking>, </thinking>, etc.
-            .replace(/<\/?(thought|think|thinking|reasoning|reason)\s*[^>]*>/gi, '')
-            // HTML-style reasoning tags
-            .replace(/<(thought|think|thinking|reasoning|reason)>[\s\S]*?<\/\1>/gi, '')
-            .replace(/<(thought|think|thinking|reasoning|reason)\/>/gi, '')
-            .replace(/<(thought|think|thinking|reasoning|reason)\s*\/>/gi, '')
-            .trim();
+        // Strategy 1: split by --- separators
+        let blocks = cleanedText.split(BLOCK_SEPARATOR);
 
-
-
-        const suggestions = [];
-        let blocks = [];
-
-        // Broad emoji pattern that catches most emojis including extended ranges
-        const emojiRegex = /[\u{1F000}-\u{1F02B}\u{1F0A0}-\u{1F0FF}\u{1F100}-\u{1F1FF}\u{1F300}-\u{1F9FF}\u{2600}-\u{26FF}\u{2700}-\u{27BF}\u{1F600}-\u{1F64F}\u{1F680}-\u{1F6FF}\u{2300}-\u{23FF}\u{2B00}-\u{2BFF}\u{2B50}\u{1FA00}-\u{1FAFF}]/gu;
-
-        // Strategy 1: Split by --- separator (various formats)
-        blocks = cleanedText.split(/\n---\n|\n---|---\n|\n\n---\n\n/);
-
-        // Strategy 2: Split by double newlines (common format)
+        // Strategy 2: split by blank lines
         if (blocks.length <= 1) {
             blocks = cleanedText.split(/\n\n+/);
         }
 
-        // Strategy 3: If still few blocks, try to find emoji patterns anywhere
+        // Strategy 3: use each emoji as the start of a block
         if (blocks.length <= 2) {
-            // Find all emojis in the text and use them as split points
-            const emojiMatches = [...cleanedText.matchAll(emojiRegex)];
+            const emojiMatches = [...cleanedText.matchAll(emojiRegexGlobal)];
             if (emojiMatches.length >= 2) {
                 blocks = [];
                 for (let i = 0; i < emojiMatches.length; i++) {
                     const start = emojiMatches[i].index;
                     const end = i < emojiMatches.length - 1 ? emojiMatches[i + 1].index : cleanedText.length;
                     const block = cleanedText.substring(start, end).trim();
-                    if (block.length > 10) {
-                        blocks.push(block);
-                    }
+                    if (block.length > 10) blocks.push(block);
                 }
             }
         }
 
-        // Strategy 4: Split by numbered patterns like "1." or "1)" at line start
+        // Strategy 4: numbered lines like "1." or "1)"
         if (blocks.length <= 2) {
-            const numberedBlocks = cleanedText.split(/\n(?=\d+[\.\)]\s)/);
-            if (numberedBlocks.length > blocks.length) {
-                blocks = numberedBlocks;
-                log('Strategy 4 (numbered) found', blocks.length, 'blocks');
-            }
+            const numberedBlocks = cleanedText.split(/\n(?=\d+[.)]\s)/);
+            if (numberedBlocks.length > blocks.length) blocks = numberedBlocks;
         }
 
-        for (const block of blocks) {
-            let trimmed = block.trim();
-            if (!trimmed || trimmed.length < 10) continue;
-
-            // Strip any remaining reasoning tags from this block
-            trimmed = trimmed
-                // XML-style reasoning tags
-                .replace(/<\/?(thought|think|thinking|reasoning|reason)\s*[^>]*>/gi, '')
-                // HTML-style reasoning tags
-                .replace(/<(thought|think|thinking|reasoning|reason)>[\s\S]*?<\/\1>/gi, '')
-                .replace(/<[^>]*>/g, '')
-                .trim();
-
-            if (!trimmed || trimmed.length < 10) continue;
-
-            // Find the first emoji in this block
-            const emojiMatch = trimmed.match(emojiRegex);
-            let emoji = '✨';
-            let title = '';
-            let description = '';
-
-            if (emojiMatch) {
-                emoji = emojiMatch[0];
-                const emojiIndex = trimmed.indexOf(emoji);
-                // Get text after emoji as title (first line or until next newline)
-                const afterEmoji = trimmed.substring(emojiIndex + emoji.length).trim();
-                const newlineIndex = afterEmoji.indexOf('\n');
-
-                if (newlineIndex > 0) {
-                    title = afterEmoji.substring(0, newlineIndex).trim();
-                    description = afterEmoji.substring(newlineIndex + 1).trim();
-                } else {
-                    title = afterEmoji;
-                    description = '';
-                }
-            } else {
-                // No emoji, just use first line as title
-                const lines = trimmed.split('\n');
-                title = lines[0].trim();
-                description = lines.slice(1).join(' ').trim();
-            }
-
-            // Remove leading numbers like "1." or "1)"
-            title = title.replace(/^\d+[\.\)]\s*/, '');
-
-            // Strip markdown formatting from title
-            title = title.replace(/\*\*([^*]+)\*\*/g, '$1');
-            title = title.replace(/\*([^*]+)\*/g, '$1');
-            title = title.replace(/^\*+\s*|\s*\*+$/g, '').trim();
-            title = title.replace(/\s+/g, ' ');
-
-            // Strip markdown from description
-            description = description
-                .replace(/\*\*([^*]+)\*\*/g, '$1')
-                .replace(/\*([^*]+)\*/g, '$1')
-                .replace(/\s+/g, ' ')
-                .trim();
-
-            if (title && title.length > 2 && title.length < 150) {
-                suggestions.push({
-                    emoji,
-                    title: title.substring(0, 100),
-                    description: description || 'Click to use this suggestion'
-                });
-            }
-        }
-
+        const suggestions = blocks.map(parseOneBlock).filter(Boolean);
         log('Parsed', suggestions.length, 'suggestions');
-        return suggestions.slice(0, settings.suggestions_count);
+        return suggestions.slice(0, maxCount);
     }
 
     // ============================================================
     // STREAMING: incremental parse and UI
     // ============================================================
 
-    const emojiRegexStream = /[\u{1F000}-\u{1F02B}\u{1F0A0}-\u{1F0FF}\u{1F100}-\u{1F1FF}\u{1F300}-\u{1F9FF}\u{2600}-\u{26FF}\u{2700}-\u{27BF}\u{1F600}-\u{1F64F}\u{1F680}-\u{1F6FF}\u{2300}-\u{23FF}\u{2B00}-\u{2BFF}\u{2B50}\u{1FA00}-\u{1FAFF}]/gu;
+    const STREAMING_SOURCES = ['ollama', 'openai', 'profile'];
+
+    function stripMarkdown(text) {
+        return text
+            .replace(/\*\*([^*]+)\*\*/g, '$1')
+            .replace(/\*([^*]+)\*/g, '$1')
+            .replace(/^#+\s*/, '')
+            .replace(/^\*+\s*|\s*\*+$/g, '')
+            .replace(/\s+/g, ' ')
+            .trim();
+    }
 
     /** Parse a single suggestion block into { emoji, title, description } or null */
     function parseOneBlock(blockText) {
         if (!blockText || typeof blockText !== 'string') return null;
-        let trimmed = blockText
-            // XML-style reasoning tags
-            .replace(/<\/?(thought|think|thinking|reasoning|reason)\s*[^>]*>/gi, '')
-            // HTML-style reasoning tags
-            .replace(/<(thought|think|thinking|reasoning|reason)>[\s\S]*?<\/\1>/gi, '')
-            .replace(/<[^>]*>/g, '')
-            .trim();
+        const trimmed = stripReasoning(blockText).replace(/<[^>]*>/g, '').trim();
         if (trimmed.length < 10) return null;
 
         let emoji = '✨';
         let title = '';
         let description = '';
 
-        const emojiMatch = trimmed.match(emojiRegexStream);
-        if (emojiMatch) {
-            emoji = emojiMatch[0];
-            const emojiIndex = trimmed.indexOf(emoji);
-            const afterEmoji = trimmed.substring(emojiIndex + emoji.length).trim();
+        const emojiMatch = trimmed.match(emojiRegex);
+        // Only treat the emoji as the card icon when it starts the title line
+        if (emojiMatch && emojiMatch.index <= 8 && !trimmed.substring(0, emojiMatch.index).includes('\n')) {
+            // Keep variation selectors, skin tones and ZWJ sequences with the emoji
+            const rest = trimmed.substring(emojiMatch.index);
+            emoji = rest.match(EMOJI_SEQUENCE_REGEX)?.[0] || emojiMatch[0];
+            const afterEmoji = trimmed.substring(emojiMatch.index + emoji.length).trim();
             const newlineIndex = afterEmoji.indexOf('\n');
             if (newlineIndex > 0) {
-                title = afterEmoji.substring(0, newlineIndex).trim();
-                description = afterEmoji.substring(newlineIndex + 1).trim();
+                title = afterEmoji.substring(0, newlineIndex);
+                description = afterEmoji.substring(newlineIndex + 1);
             } else {
                 title = afterEmoji;
             }
         } else {
             const lines = trimmed.split('\n');
-            title = lines[0].trim();
-            description = lines.slice(1).join(' ').trim();
+            title = lines[0];
+            description = lines.slice(1).join(' ');
         }
-        title = title.replace(/^\d+[\.\)]\s*/, '');
-        title = title.replace(/\*\*([^*]+)\*\*/g, '$1').replace(/\*([^*]+)\*/g, '$1').replace(/^\*+\s*|\s*\*+$/g, '').trim().replace(/\s+/g, ' ');
-        description = description.replace(/\*\*([^*]+)\*\*/g, '$1').replace(/\*([^*]+)\*/g, '$1').replace(/\s+/g, ' ').trim();
+
+        title = stripMarkdown(title.replace(/^\s*\d+[.)]\s*/, ''));
+        description = stripMarkdown(description);
         if (!title || title.length < 2 || title.length > 150) return null;
         return {
             emoji,
             title: title.substring(0, 100),
-            description: description || 'Click to use this suggestion'
+            // Never insert placeholder text into the chat; fall back to the title
+            description: description || title,
         };
     }
 
     /** Split streamed buffer into complete blocks and current partial (for --- or double newline) */
     function splitStreamBuffer(buffer) {
-        if (!buffer || !buffer.trim()) return { completeBlocks: [], partial: '' };
-        let cleaned = buffer
-            .replace(/<(thought|think|thinking|reasoning|reason)>[\s\S]*?<\/\1>/gi, '')
-            .replace(/<(thought|think|thinking|reasoning|reason)\/>/gi, '')
-            .trim();
-        const bySeparator = cleaned.split(/\n---\n|\n---|---\n|\n\n---\n\n/);
-        if (bySeparator.length > 1) {
-            const completeBlocks = bySeparator.slice(0, -1).map(s => s.trim()).filter(s => s.length >= 10);
-            const partial = bySeparator[bySeparator.length - 1].trim();
-            return { completeBlocks, partial };
-        }
-        const byDoubleNewline = cleaned.split(/\n\n+/);
-        if (byDoubleNewline.length > 1) {
-            const completeBlocks = byDoubleNewline.slice(0, -1).map(s => s.trim()).filter(s => s.length >= 10);
-            const partial = byDoubleNewline[byDoubleNewline.length - 1].trim();
-            return { completeBlocks, partial };
+        const cleaned = stripReasoning(buffer);
+        if (!cleaned) return { completeBlocks: [], partial: '' };
+        for (const separator of [BLOCK_SEPARATOR, /\n\n+/]) {
+            const parts = cleaned.split(separator);
+            if (parts.length > 1) {
+                return {
+                    completeBlocks: parts.slice(0, -1).map(s => s.trim()).filter(s => s.length >= 10),
+                    partial: parts[parts.length - 1].trim(),
+                };
+            }
         }
         return { completeBlocks: [], partial: cleaned };
     }
 
-    function showStreamingState(outputContainer, category) {
+    function showStreamingState(outputContainer, category, slotCount) {
         const body = outputContainer || jQuery('#pw_modal_body');
         const allCategories = getAllCategories();
-        const catName = allCategories[category]?.name || category;
-        const count = Math.max(1, Math.min(12, Number(settings.suggestions_count) || 6));
+        const catName = escapeHtmlAttr(allCategories[category]?.name || category);
+        const count = Math.max(1, Math.min(12, Number(slotCount) || 6));
         const cardsHtml = Array.from({ length: count }, (_, i) => {
             const isFirst = i === 0;
             const stateClass = isFirst ? 'pw_streaming_active' : 'pw_streaming_waiting';
@@ -1073,7 +953,7 @@ GUIDELINES:
                 ${cardsHtml}
             </div>
         `);
-        jQuery('#pw_cancel_gen').off('click').on('click', function (e) {
+        body.find('#pw_cancel_gen').off('click').on('click', function (e) {
             e.stopPropagation();
             e.preventDefault();
             if (abortController) abortController.abort();
@@ -1086,11 +966,11 @@ GUIDELINES:
         if (!grid.length) return;
         const card = grid.find('.pw_streaming_active');
         if (!card.length) return;
-        const { DOMPurify } = SillyTavern.libs;
-        const safe = DOMPurify.sanitize(partialText || '', { ALLOWED_TAGS: [] });
-        const firstLine = safe.split('\n')[0].trim() || '…';
+        // .text() escapes, so no sanitizing is needed here
+        const text = String(partialText || '').replace(/<[^>]*>/g, '');
+        const firstLine = text.split('\n')[0].trim() || '…';
         card.find('.pw_card_title').text(firstLine.substring(0, 100));
-        card.find('.pw_card_description').text(safe).removeClass('pw_streaming_placeholder');
+        card.find('.pw_card_description').text(text).removeClass('pw_streaming_placeholder');
     }
 
     function appendStreamingCardAsComplete(suggestion, outputContainer, suggestionsArray) {
@@ -1098,18 +978,14 @@ GUIDELINES:
         const grid = body.find('#pw_streaming_grid');
         if (!grid.length) return;
         const card = grid.find('.pw_streaming_active');
-        const { DOMPurify } = SillyTavern.libs;
-        const safeTitle = DOMPurify.sanitize(suggestion.title, { ALLOWED_TAGS: [] });
-        const safeDesc = DOMPurify.sanitize(suggestion.description, { ALLOWED_TAGS: [] });
-        const safeEmoji = suggestion.emoji || '✨';
         const index = suggestionsArray.length;
         suggestionsArray.push(suggestion);
 
         if (card.length) {
             card.removeClass('pw_streaming_slot pw_streaming_active pw_streaming_waiting').removeAttr('data-streaming data-slot');
-            card.find('.pw_card_emoji').text(safeEmoji);
-            card.find('.pw_card_title').text(safeTitle);
-            card.find('.pw_card_description').text(safeDesc);
+            card.find('.pw_card_emoji').text(suggestion.emoji || '✨');
+            card.find('.pw_card_title').text(suggestion.title);
+            card.find('.pw_card_description').text(suggestion.description);
             card.find('.pw_card_actions').attr('style', '').html(`
                 <button class="pw_card_action_btn" data-action="copy" title="Copy to clipboard"><i class="fa-solid fa-copy"></i> Copy</button>
                 <button class="pw_card_action_btn" data-action="insert" title="Insert into input field"><i class="fa-solid fa-plus"></i> Insert</button>
@@ -1141,323 +1017,147 @@ GUIDELINES:
         body.find('.pw_streaming_slot').remove();
     }
 
-    /**
-     * Consume a ReadableStream (e.g. from Connection Profile / Gemini); detect SSE or NDJSON and push text into addContent.
-     * @param {ReadableStream} stream - response.body or any getReader()-able stream
-     * @param {function(string): void} addContent - called with extracted text (may be called many times)
-     * @param {function(string, boolean): void} onChunk - optional (chunkText, isFirst) for logging
-     */
-    async function consumeGenericStream(stream, addContent, onChunk) {
-        const reader = stream.getReader();
+    /** Streaming diagnostics; only printed when DEBUG is on. */
+    function streamLog(...args) {
+        if (DEBUG) console.log(STREAM_LOG, ...args);
+    }
+
+    /** Read an SSE (OpenAI) or NDJSON (Ollama) byte stream and pass each text delta to onText. */
+    async function consumeByteStream(body, onText) {
+        const reader = body.getReader();
         const decoder = new TextDecoder();
         let buffer = '';
-        let first = true;
+
+        const handleLine = (line) => {
+            const trimmed = line.trim();
+            if (!trimmed) return;
+            const isSse = trimmed.startsWith('data:');
+            const payload = isSse ? trimmed.slice(5).trim() : trimmed;
+            if (payload === '[DONE]') return;
+            try {
+                const obj = JSON.parse(payload);
+                const text = obj.choices?.[0]?.delta?.content ?? obj.response ?? obj.message?.content;
+                if (text) onText(text);
+            } catch (_) { /* partial or non-JSON line */ }
+        };
+
         while (true) {
             const { value, done } = await reader.read();
             if (done) break;
             buffer += decoder.decode(value, { stream: true });
             const lines = buffer.split('\n');
             buffer = lines.pop() || '';
-            for (const line of lines) {
-                const trimmed = line.trim();
-                if (!trimmed) continue;
-                if (trimmed.startsWith('data:')) {
-                    const dataStr = trimmed.slice(5).trim();
-                    if (dataStr === '[DONE]') continue;
-                    try {
-                        const obj = JSON.parse(dataStr);
-                        const delta = obj.choices?.[0]?.delta?.content;
-                        if (delta) {
-                            if (onChunk && first) { onChunk(delta, true); first = false; }
-                            addContent(delta);
-                        }
-                    } catch (_) { }
-                } else {
-                    try {
-                        const obj = JSON.parse(trimmed);
-                        if (obj.response != null) {
-                            if (onChunk && first) { onChunk(obj.response, true); first = false; }
-                            addContent(obj.response);
-                        }
-                    } catch (_) { }
-                }
-            }
+            lines.forEach(handleLine);
         }
-        if (buffer.trim()) {
-            if (buffer.trim().startsWith('data:')) {
-                try {
-                    const obj = JSON.parse(buffer.trim().slice(5).trim());
-                    const delta = obj.choices?.[0]?.delta?.content;
-                    if (delta) addContent(delta);
-                } catch (_) { }
-            } else {
-                try {
-                    const obj = JSON.parse(buffer.trim());
-                    if (obj.response != null) addContent(obj.response);
-                } catch (_) { addContent(buffer); }
-            }
-        }
+        handleLine(buffer);
     }
 
-    async function runStreamingGeneration(opts) {
-        const { source, categoryPrompt, userPrompt, calculatedMaxTokens, category, outputContainer, abortController } = opts;
+    async function runStreamingGeneration({ source, systemPrompt, userPrompt, maxTokens, category, outputContainer, signal, maxSuggestions }) {
         const body = outputContainer || jQuery('#pw_modal_body');
         const suggestionsArray = [];
         let contentBuffer = '';
         let processedBlockCount = 0;
-        const maxSuggestions = settings.suggestions_count;
 
-        showStreamingState(outputContainer, category);
-        if (source === 'profile' || source === 'default') {
-            console.log(STREAM_LOG, source === 'profile' ? 'Connection Profile' : 'Main API', 'streaming attempt started. Copy these logs to debug.');
-        }
+        showStreamingState(outputContainer, category, maxSuggestions);
+
+        const addParsed = (block) => {
+            if (suggestionsArray.length >= maxSuggestions) return;
+            const suggestion = parseOneBlock(block);
+            if (suggestion) appendStreamingCardAsComplete(suggestion, outputContainer, suggestionsArray);
+        };
 
         const processBuffer = () => {
             const { completeBlocks, partial } = splitStreamBuffer(contentBuffer);
-            const newBlocks = completeBlocks.slice(processedBlockCount);
+            completeBlocks.slice(processedBlockCount).forEach(addParsed);
             processedBlockCount = completeBlocks.length;
-            for (const block of newBlocks) {
-                if (suggestionsArray.length >= maxSuggestions) break;
-                const suggestion = parseOneBlock(block);
-                if (suggestion) {
-                    appendStreamingCardAsComplete(suggestion, outputContainer, suggestionsArray);
-                }
-            }
             updateStreamingCardContent(partial, outputContainer);
         };
+
+        const appendText = (text) => {
+            contentBuffer += text;
+            processBuffer();
+        };
+
+        const messages = [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: userPrompt },
+        ];
 
         try {
             if (source === 'profile') {
                 const stContext = SillyTavern.getContext();
-                const cm = stContext?.extensionSettings?.connectionManager;
-                const profile = cm?.profiles?.find(p => p.name === settings.preset);
-                if (!profile) throw new Error(`Profile '${settings.preset}' not found`);
-                if (!stContext.ConnectionManagerRequestService) throw new Error('ConnectionManagerRequestService not available');
-                const messages = [
-                    { role: 'system', content: categoryPrompt },
-                    { role: 'user', content: userPrompt }
-                ];
-                const requestOpts = {
-                    stream: true,
-                    signal: abortController.signal,
-                    extractData: true,
-                    includePreset: true,
-                    includeInstruct: true
-                };
-                console.log(STREAM_LOG, 'Connection Profile: attempting stream=true', { profileName: profile.name, profileId: profile.id, maxTokens: calculatedMaxTokens, requestOptsKeys: Object.keys(requestOpts) });
-                let rawResponse = stContext.ConnectionManagerRequestService.sendRequest(profile.id, messages, calculatedMaxTokens, requestOpts);
-                let response = rawResponse && typeof rawResponse.then === 'function' ? await rawResponse : rawResponse;
-                if (typeof response === 'function') {
-                    console.log(STREAM_LOG, 'Connection Profile: response is a function (generator?), calling it to get iterator');
-                    response = response();
-                    if (response && typeof response.then === 'function') response = await response;
-                }
-                const isAsyncIterable = response != null && (typeof response[Symbol.asyncIterator] === 'function' || typeof response.next === 'function');
-                console.log(STREAM_LOG, 'Connection Profile: response received', { type: typeof response, constructor: response?.constructor?.name, hasBody: !!response?.body, hasGetReader: typeof response?.body?.getReader === 'function', hasContent: !!response?.content, contentLength: typeof response?.content === 'string' ? response.content.length : 0, isAsyncIterable });
-                if (response?.content != null && typeof response.content === 'string') {
-                    console.log(STREAM_LOG, 'Connection Profile: full content (non-streaming), using as single buffer. Length:', response.content.length);
-                    contentBuffer = response.content;
+                const profile = getSelectedProfile(stContext);
+                let response = await stContext.ConnectionManagerRequestService.sendRequest(
+                    profile.id, messages, maxTokens,
+                    { stream: true, signal, extractData: true, includePreset: true, includeInstruct: true },
+                );
+                // SillyTavern returns a function that creates an async generator
+                if (typeof response === 'function') response = await response();
+                streamLog('Connection Profile response', { type: typeof response, constructor: response?.constructor?.name });
+
+                if (typeof response === 'string' || typeof response?.content === 'string') {
+                    // The API answered without streaming
+                    contentBuffer = typeof response === 'string' ? response : response.content;
                     processBuffer();
-                } else if (response && typeof response === 'string') {
-                    console.log(STREAM_LOG, 'Connection Profile: response is string (non-streaming). Length:', response.length);
-                    contentBuffer = response;
-                    processBuffer();
-                } else if (isAsyncIterable) {
-                    console.log(STREAM_LOG, 'Connection Profile: consuming response as async iterator (e.g. AsyncGenerator from Gemini)');
-                    let firstChunk = true;
-                    try {
-                        for await (const chunk of response) {
-                            if (abortController.signal.aborted) break;
-                            let text = '';
-                            if (typeof chunk === 'string') text = chunk;
-                            else if (chunk && typeof chunk === 'object') {
-                                text = chunk.choices?.[0]?.delta?.content ?? chunk.content ?? chunk.response ?? (typeof chunk.text === 'string' ? chunk.text : '');
-                            }
-                            if (text) {
-                                if (firstChunk) {
-                                    console.log(STREAM_LOG, 'Connection Profile: first chunk sample (first 200 chars):', JSON.stringify(String(text).slice(0, 200)));
-                                    firstChunk = false;
-                                }
-                                if (contentBuffer.length === 0) {
-                                    contentBuffer = text;
-                                } else if (text.startsWith(contentBuffer)) {
-                                    contentBuffer = text;
-                                } else {
-                                    contentBuffer += text;
-                                }
-                                processBuffer();
-                            }
+                } else if (response && typeof response[Symbol.asyncIterator] === 'function') {
+                    for await (const chunk of response) {
+                        if (signal.aborted) break;
+                        if (typeof chunk?.text === 'string') {
+                            // SillyTavern yields the cumulative text so far
+                            contentBuffer = chunk.text;
+                            processBuffer();
+                        } else if (typeof chunk === 'string') {
+                            appendText(chunk);
                         }
-                        console.log(STREAM_LOG, 'Connection Profile: async iterator finished. Total content length:', contentBuffer.length);
-                    } catch (iterErr) {
-                        console.log(STREAM_LOG, 'Connection Profile: async iterator error:', iterErr?.message || String(iterErr));
-                        throw iterErr;
                     }
-                } else if (response?.body && typeof response.body.getReader === 'function') {
-                    console.log(STREAM_LOG, 'Connection Profile: consuming response.body as ReadableStream');
-                    await consumeGenericStream(response.body, (text) => { contentBuffer += text; processBuffer(); }, (chunk, isFirst) => {
-                        if (isFirst) console.log(STREAM_LOG, 'Connection Profile: first chunk sample (first 200 chars):', JSON.stringify(String(chunk).slice(0, 200)));
-                    });
-                    console.log(STREAM_LOG, 'Connection Profile: stream finished. Total content length:', contentBuffer.length);
-                } else if (response && typeof response.getReader === 'function') {
-                    console.log(STREAM_LOG, 'Connection Profile: consuming response as ReadableStream');
-                    await consumeGenericStream(response, (text) => { contentBuffer += text; processBuffer(); }, (chunk, isFirst) => {
-                        if (isFirst) console.log(STREAM_LOG, 'Connection Profile: first chunk sample (first 200 chars):', JSON.stringify(String(chunk).slice(0, 200)));
-                    });
-                    console.log(STREAM_LOG, 'Connection Profile: stream finished. Total content length:', contentBuffer.length);
+                } else if (response?.body?.getReader) {
+                    await consumeByteStream(response.body, appendText);
                 } else {
-                    console.log(STREAM_LOG, 'Connection Profile: unknown response shape, attempting to extract text. Keys:', response ? Object.keys(response) : []);
-                    const text = response?.choices?.[0]?.message?.content ?? (typeof response === 'string' ? response : '');
-                    if (text) contentBuffer = text; processBuffer();
+                    throw new Error('Connection profile did not return a stream');
                 }
-            } else if (source === 'default') {
-                const stContext = SillyTavern.getContext();
-                const { generateRaw } = stContext;
-                if (!generateRaw) throw new Error('generateRaw not available in context');
-                console.log(STREAM_LOG, 'Main API: attempting streaming: true');
-                let rawResult = generateRaw({ systemPrompt: categoryPrompt, prompt: userPrompt, streaming: true });
-                const result = rawResult && typeof rawResult.then === 'function' ? await rawResult : rawResult;
-                console.log(STREAM_LOG, 'Main API: result received', { type: typeof result, constructor: result?.constructor?.name, hasGetReader: typeof result?.getReader === 'function', hasBody: !!result?.body, stringLength: typeof result === 'string' ? result.length : 0 });
-                if (typeof result === 'string') {
-                    console.log(STREAM_LOG, 'Main API: full string (non-streaming). Length:', result.length);
-                    contentBuffer = result;
-                    processBuffer();
-                } else if (result?.body && typeof result.body.getReader === 'function') {
-                    console.log(STREAM_LOG, 'Main API: consuming result.body as ReadableStream');
-                    await consumeGenericStream(result.body, (text) => { contentBuffer += text; processBuffer(); }, (chunk, isFirst) => {
-                        if (isFirst) console.log(STREAM_LOG, 'Main API: first chunk sample:', JSON.stringify(String(chunk).slice(0, 200)));
-                    });
-                } else if (result && typeof result.getReader === 'function') {
-                    console.log(STREAM_LOG, 'Main API: consuming result as ReadableStream');
-                    await consumeGenericStream(result, (text) => { contentBuffer += text; processBuffer(); }, (chunk, isFirst) => {
-                        if (isFirst) console.log(STREAM_LOG, 'Main API: first chunk sample:', JSON.stringify(String(chunk).slice(0, 200)));
-                    });
-                } else {
-                    console.log(STREAM_LOG, 'Main API: unknown result shape. Using as non-streaming.');
-                    contentBuffer = (result && typeof result === 'object' && result.content) ? result.content : String(result ?? '');
-                    processBuffer();
-                }
-            } else if (source === 'ollama') {
-                const baseUrl = (settings.ollama_url || 'http://localhost:11434').replace(/\/$/, '');
-                if (!settings.ollama_model) throw new Error('No Ollama model selected');
-                log(`Streaming with Ollama: ${settings.ollama_model}`);
-                const response = await fetch(`${baseUrl}/api/generate`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
+            } else {
+                let url;
+                let headers = { 'Content-Type': 'application/json' };
+                let payload;
+                if (source === 'ollama') {
+                    if (!settings.ollama_model) throw new Error('No Ollama model selected');
+                    url = `${(settings.ollama_url || 'http://localhost:11434').replace(/\/$/, '')}/api/generate`;
+                    payload = {
                         model: settings.ollama_model,
-                        system: categoryPrompt,
+                        system: systemPrompt,
                         prompt: userPrompt,
                         stream: true,
-                        options: { num_ctx: 8192, num_predict: calculatedMaxTokens }
-                    }),
-                    signal: abortController.signal
-                });
-                if (!response.ok) throw new Error(`Ollama API error: ${response.status}`);
-                const reader = response.body.getReader();
-                const decoder = new TextDecoder();
-                let lineBuffer = '';
-                while (true) {
-                    const { value, done } = await reader.read();
-                    if (done) break;
-                    lineBuffer += decoder.decode(value, { stream: true });
-                    const lines = lineBuffer.split('\n');
-                    lineBuffer = lines.pop() || '';
-                    for (const line of lines) {
-                        const trimmed = line.trim();
-                        if (!trimmed) continue;
-                        try {
-                            const obj = JSON.parse(trimmed);
-                            if (obj.response) contentBuffer += obj.response;
-                        } catch (_) { /* skip invalid JSON */ }
-                    }
-                    processBuffer();
-                }
-                if (lineBuffer.trim()) {
-                    try {
-                        const obj = JSON.parse(lineBuffer.trim());
-                        if (obj.response) contentBuffer += obj.response;
-                    } catch (_) { }
-                }
-            } else if (source === 'openai') {
-                const baseUrl = (settings.openai_url || 'http://localhost:1234/v1').replace(/\/$/, '');
-                log(`Streaming with OpenAI-compatible: ${baseUrl}`);
-                const headers = { 'Content-Type': 'application/json' };
-                if (settings.openai_key) headers['Authorization'] = `Bearer ${settings.openai_key}`;
-                const response = await fetch(`${baseUrl}/chat/completions`, {
-                    method: 'POST',
-                    headers,
-                    body: JSON.stringify({
+                        options: { num_ctx: 8192, num_predict: maxTokens },
+                    };
+                } else {
+                    url = `${(settings.openai_url || 'http://localhost:1234/v1').replace(/\/$/, '')}/chat/completions`;
+                    if (settings.openai_key) headers['Authorization'] = `Bearer ${settings.openai_key}`;
+                    payload = {
                         model: settings.openai_model || 'local-model',
-                        messages: [
-                            { role: 'system', content: categoryPrompt },
-                            { role: 'user', content: userPrompt }
-                        ],
+                        messages,
                         temperature: 0.8,
-                        max_tokens: calculatedMaxTokens,
-                        stream: true
-                    }),
-                    signal: abortController.signal
-                });
-                if (!response.ok) throw new Error(`API error: ${response.status}`);
-                const reader = response.body.getReader();
-                const decoder = new TextDecoder();
-                let sseBuffer = '';
-                while (true) {
-                    const { value, done } = await reader.read();
-                    if (done) break;
-                    sseBuffer += decoder.decode(value, { stream: true });
-                    const eventEnd = sseBuffer.indexOf('\n\n');
-                    if (eventEnd === -1) continue;
-                    const events = sseBuffer.split(/\n\n+/);
-                    sseBuffer = events.pop() || '';
-                    for (const event of events) {
-                        const lines = event.split('\n');
-                        for (const line of lines) {
-                            if (!line.startsWith('data:')) continue;
-                            const dataStr = line.slice(5).trim();
-                            if (dataStr === '[DONE]') continue;
-                            try {
-                                const obj = JSON.parse(dataStr);
-                                const delta = obj.choices?.[0]?.delta?.content;
-                                if (delta) contentBuffer += delta;
-                            } catch (_) { }
-                        }
-                    }
-                    processBuffer();
+                        max_tokens: maxTokens,
+                        stream: true,
+                    };
                 }
+                const response = await fetch(url, { method: 'POST', headers, body: JSON.stringify(payload), signal });
+                if (!response.ok) throw new Error(`${source === 'ollama' ? 'Ollama API' : 'API'} error: ${response.status}`);
+                await consumeByteStream(response.body, appendText);
             }
         } finally {
-            // Process any remaining complete blocks and final partial
+            // Parse whatever is left, including the final block without a trailing ---
             const { completeBlocks, partial } = splitStreamBuffer(contentBuffer);
-            const remainingBlocks = completeBlocks.slice(processedBlockCount);
-            for (const block of remainingBlocks) {
-                if (suggestionsArray.length >= maxSuggestions) break;
-                const suggestion = parseOneBlock(block);
-                if (suggestion) appendStreamingCardAsComplete(suggestion, outputContainer, suggestionsArray);
-            }
-            if (suggestionsArray.length < maxSuggestions && partial.trim().length >= 10) {
-                const tailSplit = splitStreamBuffer(partial);
-                for (const block of tailSplit.completeBlocks) {
-                    if (suggestionsArray.length >= maxSuggestions) break;
-                    const suggestion = parseOneBlock(block);
-                    if (suggestion) appendStreamingCardAsComplete(suggestion, outputContainer, suggestionsArray);
-                }
-                if (suggestionsArray.length < maxSuggestions && tailSplit.partial.trim().length >= 10) {
-                    const suggestion = parseOneBlock(tailSplit.partial);
-                    if (suggestion) appendStreamingCardAsComplete(suggestion, outputContainer, suggestionsArray);
-                }
-            }
+            completeBlocks.slice(processedBlockCount).forEach(addParsed);
+            if (partial.length >= 10) addParsed(partial);
             removeStreamingPlaceholderCard(outputContainer);
         }
 
-        if (abortController.signal.aborted) throw new DOMException('Aborted', 'AbortError');
+        if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
 
+        body.find('.pw_status').remove();
         if (suggestionsArray.length > 0) {
             if (category !== 'director') cachedSuggestions[category] = suggestionsArray;
-            body.find('.pw_status').remove();
         } else {
-            body.find('.pw_status').remove();
             showEmptyState('No suggestions could be generated. Try again.', outputContainer);
         }
     }
@@ -1480,38 +1180,18 @@ GUIDELINES:
         const allCategories = getAllCategories();
 
         // 4. Surprise Dropdown (built first so it can be inserted right after Director)
-        let surpriseItems = '';
-        // Main categories
-        for (const [key, cat] of Object.entries(MAIN_CATEGORIES)) {
-            if (cat.nsfw && !settings.show_explicit) continue;
-            const sIcon = allCategories[key]?.icon || cat.icon;
-            surpriseItems += `
-                <button class="pw_dropdown_item pw_surprise_item" data-surprise-category="${key}">
-                    <i class="fa-solid ${sIcon}"></i>
-                    <span>${cat.name}</span>
-                </button>`;
-        }
-        // Genre categories
-        const sortedGenresSurprise = Object.entries(GENRE_CATEGORIES).sort((a, b) => a[1].name.localeCompare(b[1].name));
-        for (const [key, cat] of sortedGenresSurprise) {
-            if (cat.nsfw && !settings.show_explicit) continue;
-            const sIcon = allCategories[key]?.icon || cat.icon;
-            surpriseItems += `
-                <button class="pw_dropdown_item pw_surprise_item" data-surprise-category="${key}">
-                    <i class="fa-solid ${sIcon}"></i>
-                    <span>${cat.name}</span>
-                </button>`;
-        }
-        // Custom styles
-        if (settings.custom_styles?.length) {
-            for (const style of settings.custom_styles) {
-                surpriseItems += `
-                    <button class="pw_dropdown_item pw_surprise_item" data-surprise-category="${style.id}">
-                        <i class="fa-solid ${style.icon}"></i>
-                        <span>${style.name}</span>
-                    </button>`;
-            }
-        }
+        const surpriseStyles = [
+            ...Object.entries(MAIN_CATEGORIES),
+            ...Object.entries(GENRE_CATEGORIES).sort((a, b) => a[1].name.localeCompare(b[1].name)),
+        ]
+            .filter(([, cat]) => !cat.nsfw || settings.show_explicit)
+            .map(([key, cat]) => ({ id: key, name: cat.name, icon: allCategories[key]?.icon || cat.icon }))
+            .concat((settings.custom_styles || []).map(style => ({ id: style.id, name: style.name, icon: style.icon })));
+        const surpriseItems = surpriseStyles.map(style => `
+                <button class="pw_dropdown_item pw_surprise_item" data-surprise-category="${esc(style.id)}">
+                    <i class="fa-solid ${esc(style.icon)}"></i>
+                    <span>${esc(style.name)}</span>
+                </button>`).join('');
 
         const surpriseCount = activeSurprises.length;
         const surpriseIndicatorHtml = surpriseCount > 0
@@ -1585,10 +1265,10 @@ GUIDELINES:
                 customItems += `
                     <button class="pw_dropdown_item" data-category="${style.id}">
                         <i class="fa-solid ${style.icon}"></i>
-                        <span>${style.name}</span>
+                        <span>${esc(style.name)}</span>
                     </button>`;
                 // Also add to the mobile/fallback select
-                categoryOptionsHtml += `<option value="${style.id}">${style.name}</option>`;
+                categoryOptionsHtml += `<option value="${style.id}">${esc(style.name)}</option>`;
             }
 
             customDropdownHtml = `
@@ -1652,6 +1332,9 @@ GUIDELINES:
             <select class="pw_category_dropdown" title="Select a suggestion style">
                 <option value="" disabled selected>Style...</option>
                 ${categoryOptionsHtml}
+                <optgroup label="Surprise Me">
+                    ${surpriseStyles.map(style => `<option value="surprise:${esc(style.id)}">${esc(style.name)}</option>`).join('')}
+                </optgroup>
             </select>
             <div class="pw_bar_right">
                 <span class="pw_hover_label" id="pw_hover_label"></span>
@@ -1684,6 +1367,9 @@ GUIDELINES:
 
         actionBar = jQuery('.pw_action_bar');
         if (actionBar.length) {
+            // SillyBunny puts its own chat bar directly above ours; the minimize
+            // tab would cover its buttons, so it moves inside the bar there.
+            actionBar.toggleClass('pw_host_sillybunny', !!document.getElementById('sb-bottom-chat-bar'));
             log('Action bar created successfully');
         } else {
             error('Failed to create action bar');
@@ -1759,7 +1445,9 @@ GUIDELINES:
         jQuery(document).on(`change${eventNs}`, '.pw_category_dropdown', function () {
             const category = this.value;
             if (category) {
-                if (category === 'director') {
+                if (category.startsWith('surprise:')) {
+                    showSurpriseModal(category.slice('surprise:'.length));
+                } else if (category === 'director') {
                     showDirectorModal();
                 } else {
                     openSuggestionsModal(category);
@@ -1814,55 +1502,53 @@ GUIDELINES:
     }
 
     function setupResponsiveBar() {
+        if (barResizeObserver) {
+            barResizeObserver.disconnect();
+            barResizeObserver = null;
+        }
+        window.removeEventListener('resize', checkBarWidth);
+
         const bar = document.querySelector('.pw_action_bar');
         if (!bar) return;
 
-        const checkWidth = () => {
-            const buttons = bar.querySelector('.pw_category_buttons');
-            const dropdown = bar.querySelector('.pw_category_dropdown');
-            if (!buttons || !dropdown) return;
-
-            // Make buttons visible temporarily so we can measure naturally
-            const prevDisplay = buttons.style.display;
-            buttons.style.display = 'flex';
-            buttons.style.flexWrap = 'nowrap';
-
-            const barRight = bar.querySelector('.pw_bar_right');
-            const title = bar.querySelector('.pw_bar_title');
-            // Sum fixed-width elements; title is hidden on very narrow screens
-            const usedWidth =
-                (title && title.offsetWidth > 0 ? title.offsetWidth + 8 : 0) +
-                (barRight ? barRight.offsetWidth + 8 : 52) +
-                32; // minimize btn + gaps
-
-            const availableForButtons = bar.offsetWidth - usedWidth;
-
-            // Only collapse to dropdown if even the smallest useful slice of buttons can't show
-            // (< 2 buttons worth ~80px). On mobile the buttons container is scrollable so
-            // all buttons remain accessible even on narrow screens.
-            if (availableForButtons < 80) {
-                buttons.style.display = 'none';
-                dropdown.style.display = 'block';
-            } else {
-                buttons.style.display = 'flex';
-                dropdown.style.display = 'none';
-            }
-        };
-
-        // Check immediately and on resize
-        checkWidth();
+        checkBarWidth();
         if (typeof ResizeObserver !== 'undefined') {
-            const observer = new ResizeObserver(checkWidth);
-            observer.observe(bar);
+            barResizeObserver = new ResizeObserver(checkBarWidth);
+            barResizeObserver.observe(bar);
         } else {
-            window.addEventListener('resize', checkWidth);
+            window.addEventListener('resize', checkBarWidth);
         }
     }
 
-    function updateActionBarVisibility() {
-        if (actionBar && actionBar.length) {
-            settings.enabled ? actionBar.show() : actionBar.hide();
-        }
+    /** Switch between the icon buttons and the "Style..." dropdown based on available width. */
+    function checkBarWidth() {
+        const bar = document.querySelector('.pw_action_bar');
+        const buttons = bar?.querySelector('.pw_category_buttons');
+        const dropdown = bar?.querySelector('.pw_category_dropdown');
+        if (!buttons || !dropdown) return;
+
+        // Show the buttons without wrapping so we can measure them
+        buttons.style.display = 'flex';
+        buttons.style.flexWrap = 'nowrap';
+
+        const barRight = bar.querySelector('.pw_bar_right');
+        const title = bar.querySelector('.pw_bar_title');
+        const usedWidth =
+            (title && title.offsetWidth > 0 ? title.offsetWidth + 8 : 0) +
+            (barRight ? barRight.offsetWidth + 8 : 52) +
+            32; // minimize button + gaps
+        const availableForButtons = bar.offsetWidth - usedWidth;
+
+        // On touch screens the button row can't be scrolled sideways (SillyBunny
+        // blocks horizontal swipes inside the chat form), so fall back to the
+        // dropdown as soon as the buttons would overflow.
+        const isTouch = window.matchMedia?.('(pointer: coarse)').matches;
+        const overflows = buttons.scrollWidth > availableForButtons + 1;
+        const useDropdown = availableForButtons < 80 || (isTouch && overflows);
+
+        buttons.style.display = useDropdown ? 'none' : 'flex';
+        dropdown.style.display = useDropdown ? 'block' : 'none';
+        bar.classList.toggle('pw_bar_collapsed', useDropdown);
     }
 
     // ============================================================
@@ -1895,7 +1581,7 @@ GUIDELINES:
                             <div class="pw_director_mode_switch">
                                 <div class="pw_mode_option ${directorMode === 'single_scene' ? 'active' : ''}" data-mode="single_scene">
                                     <div class="pw_mode_title"><i class="fa-solid fa-film"></i> Single Scene</div>
-                                    <div class="pw_mode_desc">Combine inputs into one rich scene</div>
+                                    <div class="pw_mode_desc">Several takes on one scene built from all inputs</div>
                                 </div>
                                 <div class="pw_mode_option ${directorMode === 'story_beats' ? 'active' : ''}" data-mode="story_beats">
                                     <div class="pw_mode_title"><i class="fa-solid fa-list-check"></i> Story Beats</div>
@@ -2093,7 +1779,7 @@ GUIDELINES:
             });
 
             if (directions.length === 0) {
-                alert('Please enter at least one direction.');
+                showToast('Please enter at least one direction.', 'warning');
                 return;
             }
 
@@ -2135,20 +1821,32 @@ GUIDELINES:
         suggestionsModal = jQuery('#pw_suggestions_modal');
 
         jQuery('#pw_close_suggestions').on('click', closeSuggestionsModal);
-        jQuery('#pw_refresh_btn').on('click', () => generateSuggestions(currentCategory, true));
+        jQuery('#pw_refresh_btn').on('click', () => {
+            const category = suggestionsModal.data('category');
+            if (category) generateSuggestions(category, true);
+        });
 
         suggestionsModal.on('click', (e) => {
             if (e.target === suggestionsModal[0]) closeSuggestionsModal();
         });
 
-        jQuery(document).on('keydown.pathweaver_suggestions', (e) => {
-            if (e.key === 'Escape' && suggestionsModal.hasClass('active')) closeSuggestionsModal();
+        jQuery(document).off('keydown.pathweaver_suggestions').on('keydown.pathweaver_suggestions', (e) => {
+            if (e.key !== 'Escape') return;
+            // Close the top-most open Pathweaver modal
+            if (jQuery('#pw_icon_panel').hasClass('open')) return;
+            const open = jQuery('.pw_modal_overlay.active').last();
+            if (!open.length) return;
+            const id = open.attr('id');
+            if (id === 'pw_suggestions_modal') closeSuggestionsModal();
+            else if (id === 'pw_settings_modal') closeSettingsModal();
+            else if (id === 'pw_styles_manager') closeStylesManager();
+            else if (id === 'pw_surprise_modal') open.find('#pw_close_surprise').trigger('click');
+            else open.removeClass('active');
         });
     }
 
     function openSuggestionsModal(category) {
         createSuggestionsModal();
-        currentCategory = category;
 
         const allCategories = getAllCategories();
         let catInfo = allCategories[category];
@@ -2162,14 +1860,16 @@ GUIDELINES:
             .removeClass()
             .addClass(`fa-solid ${catInfo?.icon || 'fa-compass'}`);
 
+        suggestionsModal.data('category', category);
         suggestionsModal.addClass('active');
         generateSuggestions(category);
     }
 
     function closeSuggestionsModal() {
+        // isGenerating is released by generateSuggestions once the request has
+        // really finished, so a new request can't overlap one still running.
         if (abortController) abortController.abort();
         if (suggestionsModal) suggestionsModal.removeClass('active');
-        isGenerating = false;
     }
 
     function showLoadingState(category, outputContainer = null, customMessage = null) {
@@ -2202,7 +1902,7 @@ GUIDELINES:
             <div class="pw_suggestions_grid">${skeletons}</div>
         `);
 
-        jQuery('#pw_cancel_gen').off('click').on('click', function (e) {
+        body.find('#pw_cancel_gen').off('click').on('click', function (e) {
             e.stopPropagation();
             e.preventDefault();
             if (abortController) abortController.abort();
@@ -2214,7 +1914,7 @@ GUIDELINES:
         body.html(`
             <div class="pw_empty_state">
                 <i class="fa-solid fa-compass"></i>
-                <p>${message}</p>
+                <p>${esc(message)}</p>
             </div>
         `);
     }
@@ -2224,7 +1924,7 @@ GUIDELINES:
         body.html(`
             <div class="pw_empty_state">
                 <i class="fa-solid fa-circle-exclamation" style="color: var(--pw-danger);"></i>
-                <p>${message}</p>
+                <p>${esc(message)}</p>
             </div>
         `);
     }
@@ -2269,9 +1969,11 @@ GUIDELINES:
         cardsHtml += '</div>';
         body.html(cardsHtml);
 
-        jQuery('.pw_suggestion_card').on('click', function (e) {
+        // Scope to this container: the Director and suggestion modals can both hold cards
+        body.find('.pw_suggestion_card').on('click', function (e) {
             const index = jQuery(this).data('index');
             const suggestion = suggestions[index];
+            if (!suggestion) return;
             const action = jQuery(e.target).closest('[data-action]').data('action');
 
             if (action === 'copy') {
@@ -2347,9 +2049,9 @@ GUIDELINES:
         }, 100);
     }
 
-    function showToast(message) {
+    function showToast(message, type = 'success') {
         if (typeof toastr !== 'undefined') {
-            toastr.success(message, 'Pathweaver');
+            (toastr[type] || toastr.success)(message, 'Pathweaver');
         } else {
             console.log('[Pathweaver-Toast]', message);
         }
@@ -2420,6 +2122,7 @@ GUIDELINES:
                                     <span class="pw_setting_label" style="font-size: 0.9em;">[Director: ]</span>
                                     <div class="pw_toggle ${settings.insert_type_director ? 'active' : ''}" data-setting="insert_type_director"></div>
                                 </div>
+                                <p class="pw_setting_hint" style="margin: 0;">With a wrapper on, suggestions are written as directions to the AI. Without one, they are written as your character's next message.</p>
                             </div>
 
                         </div>
@@ -2447,6 +2150,9 @@ GUIDELINES:
                                         <option value="6" ${settings.context_depth == 6 ? 'selected' : ''}>6 messages</option>
                                         <option value="8" ${settings.context_depth == 8 ? 'selected' : ''}>8 messages</option>
                                         <option value="10" ${settings.context_depth == 10 ? 'selected' : ''}>10 messages</option>
+                                        <option value="12" ${settings.context_depth == 12 ? 'selected' : ''}>12 messages</option>
+                                        <option value="16" ${settings.context_depth == 16 ? 'selected' : ''}>16 messages</option>
+                                        <option value="20" ${settings.context_depth == 20 ? 'selected' : ''}>20 messages</option>
                                     </select>
                                 </div>
                             </div>
@@ -2464,7 +2170,7 @@ GUIDELINES:
                                 <div class="pw_toggle ${settings.stream_suggestions ? 'active' : ''}" data-setting="stream_suggestions"></div>
                             </div>
                             <p class="pw_setting_hint pw_setting_stream_hint">
-                                Cards appear as each suggestion is generated. Works with Ollama and OpenAI-compatible APIs; Connection Profile may also support streaming.
+                                Cards appear as each suggestion is generated. Works with Ollama, OpenAI-compatible APIs, and most Connection Profiles. The Default (Main API) source can't stream.
                             </p>
                             
                             <!-- Reasoning Mode Settings -->
@@ -2508,8 +2214,8 @@ GUIDELINES:
                                     <span class="pw_setting_label"><i class="fa-solid fa-globe"></i> Include World Info Lorebook</span>
                                     <div class="pw_toggle ${settings.include_worldinfo ? 'active' : ''}" data-setting="include_worldinfo"></div>
                                 </div>
-                                <div class="pw_warning_text" style="width: 100%; margin-top: 4px;">
-                                    <i class="fa-solid fa-triangle-exclamation"></i> Experimental: May decrease suggestion quality. Works only on entries with Order 250 or higher.
+                                <div class="pw_setting_hint" style="width: 100%; margin-top: 4px;">
+                                    <i class="fa-solid fa-circle-info"></i> Adds the World Info entries that the recent messages activate, the same way a normal reply would.
                                 </div>
                             </div>
                         </div>
@@ -2540,7 +2246,7 @@ GUIDELINES:
                             <div class="pw_sm_provider_box" id="pw_sm_ollama_box" style="${settings.source === 'ollama' ? '' : 'display:none'}">
                                 <div class="pw_sm_provider_row">
                                     <label>URL</label>
-                                    <input type="text" id="pw_sm_ollama_url" value="${settings.ollama_url}" placeholder="http://localhost:11434">
+                                    <input type="text" id="pw_sm_ollama_url" value="${esc(settings.ollama_url)}" placeholder="http://localhost:11434">
                                 </div>
                                 <div class="pw_sm_provider_row">
                                     <label>Model</label>
@@ -2550,15 +2256,23 @@ GUIDELINES:
                             
                             <div class="pw_sm_provider_box" id="pw_sm_openai_box" style="${settings.source === 'openai' ? '' : 'display:none'}">
                                 <div class="pw_sm_provider_row">
-                                    <label>URL</label>
-                                    <input type="text" id="pw_sm_openai_url" value="${settings.openai_url}" placeholder="http://localhost:1234/v1">
+                                    <label>Preset</label>
+                                    <select id="pw_sm_openai_preset" class="pw_select text_pole">
+                                        ${Object.entries({ custom: 'Custom', lmstudio: 'LM Studio (:1234)', kobold: 'KoboldCPP (:5001)', textgen: 'TextGenWebUI (:5000)', vllm: 'vLLM (:8000)' })
+        .map(([v, label]) => `<option value="${v}" ${settings.openai_preset === v ? 'selected' : ''}>${label}</option>`).join('')}
+                                    </select>
                                 </div>
                                 <div class="pw_sm_provider_row">
-                                    <input type="text" id="pw_sm_openai_model" value="${settings.openai_model}" placeholder="Model name">
+                                    <label>URL</label>
+                                    <input type="text" id="pw_sm_openai_url" value="${esc(settings.openai_url)}" placeholder="http://localhost:1234/v1">
+                                </div>
+                                <div class="pw_sm_provider_row">
+                                    <label>Model</label>
+                                    <input type="text" id="pw_sm_openai_model" value="${esc(settings.openai_model)}" placeholder="Model name">
                                 </div>
                                 <div class="pw_sm_provider_row">
                                     <label>Key</label>
-                                    <input type="password" id="pw_sm_openai_key" value="${settings.openai_key}" placeholder="API Key (Optional)">
+                                    <input type="password" id="pw_sm_openai_key" value="${esc(settings.openai_key)}" placeholder="API Key (Optional)">
                                 </div>
                             </div>
                         </div>
@@ -2756,7 +2470,7 @@ GUIDELINES:
                     jQuery('#pw_modal_max_tokens_hint').hide();
                 }
                 // Also sync to extension panel
-                jQuery('#pw_max_output_tokens_row').toggle(settings.reasoning_mode);
+                jQuery('#pw_max_output_tokens_row, #pw_max_output_tokens_hint').toggle(!!settings.reasoning_mode);
             }
 
             saveSettings();
@@ -2779,18 +2493,25 @@ GUIDELINES:
         jQuery('#pw_sm_profile').on('change', function () { settings.preset = this.value; saveSettings(); syncSettingsToPanel(); });
         jQuery('#pw_sm_ollama_url').on('change', function () { settings.ollama_url = this.value; saveSettings(); syncSettingsToPanel(); refreshOllamaModels(); });
         jQuery('#pw_sm_ollama_model').on('change', function () { settings.ollama_model = this.value; saveSettings(); syncSettingsToPanel(); });
+        jQuery('#pw_sm_openai_preset').on('change', function () {
+            applyOpenAIPreset(this.value);
+            jQuery('#pw_sm_openai_url').val(settings.openai_url);
+            jQuery('#pw_sm_openai_model').val(settings.openai_model);
+            saveSettings();
+            syncSettingsToPanel();
+        });
         jQuery('#pw_sm_openai_url').on('change', function () { settings.openai_url = this.value; saveSettings(); syncSettingsToPanel(); });
         jQuery('#pw_sm_openai_model').on('change', function () { settings.openai_model = this.value; saveSettings(); syncSettingsToPanel(); });
         jQuery('#pw_sm_openai_key').on('change', function () { settings.openai_key = this.value; saveSettings(); syncSettingsToPanel(); });
 
         jQuery('#pw_sm_suggestions').on('change', function () {
-            settings.suggestions_count = Math.max(1, Math.min(20, parseInt(this.value) || 10));
+            settings.suggestions_count = Math.max(1, Math.min(20, parseInt(this.value) || 6));
             this.value = settings.suggestions_count;
             saveSettings();
             syncSettingsToPanel();
         });
 
-        jQuery('#pw_sm_context').on('change', function () { settings.context_depth = parseInt(this.value) || 4; saveSettings(); syncSettingsToPanel(); });
+        jQuery('#pw_sm_context').on('change', function () { settings.context_depth = parseInt(this.value) || 8; saveSettings(); syncSettingsToPanel(); });
 
         // Suggestion length
         jQuery('#pw_sm_suggestion_length').on('change', function () { settings.suggestion_length = this.value; saveSettings(); syncSettingsToPanel(); });
@@ -2857,7 +2578,7 @@ GUIDELINES:
         applyTitleFontSelectDisplay(document.getElementById('pw_sm_bar_title_font'));
 
         // Style editor opener
-        jQuery('#pw_open_style_editor').on('click', () => openStyleEditor());
+        jQuery('#pw_open_style_editor').on('click', () => openStylesManager());
 
         // Surprise Me: clear all (modal)
         jQuery('#pw_sm_surprise_clear_all').on('click', function () {
@@ -2895,7 +2616,7 @@ GUIDELINES:
         if (models.length) {
             models.forEach(m => {
                 const selected = settings.ollama_model === m.name ? ' selected' : '';
-                select.append(`<option value="${m.name}"${selected}>${m.name}</option>`);
+                select.append(`<option value="${esc(m.name)}"${selected}>${esc(m.name)}</option>`);
             });
         } else {
             select.append('<option value="">No models found</option>');
@@ -2920,32 +2641,10 @@ GUIDELINES:
     let originalBuiltinPrompts = {}; // Cache original prompts for reset
 
     // Default template for new custom styles
-    const defaultTemplate = `You are a creative writing assistant generating story suggestions.
-
-TASK: Generate suggestions for [YOUR THEME/CATEGORY HERE].
-
-TYPES TO INCLUDE:
-- [Type 1]: (description)
-- [Type 2]: (description)
-- [Type 3]: (description)
-
-OUTPUT FORMAT:
-[EMOJI] TITLE
-DESCRIPTION
-
----
-
-(Repeat for each suggestion)
-
-GUIDELINES:
-- Each suggestion should be distinct and creative
-- Keep titles punchy (under 8 words) - use plain text only, NO markdown
-- Match the tone and genre of the ongoing story
-- Do NOT include numbering or preamble`;
-
-    function openStyleEditor() {
-        openStylesManager();
-    }
+    // Default template for new custom styles. Pathweaver adds the shared rules
+    // (continuity, voice, variety, output format) around it automatically.
+    const defaultTemplate = `STYLE: [Your style name]
+Suggest developments that [describe the kind of turn you want]. Build them from the current scene: [what to look for in the recent messages, such as a character's goal or an object in the room]. [Any tone or content preferences.]`;
 
     function openStylesManager() {
         if (jQuery('#pw_styles_manager').length) {
@@ -3014,7 +2713,8 @@ GUIDELINES:
                                         </div>
                                     </div>
                                     <div class="pw_editor_row" style="flex-direction: column; align-items: flex-start; flex: 1;">
-                                        <label style="margin-bottom: 8px;">System Prompt</label>
+                                        <label style="margin-bottom: 4px;">Style Prompt</label>
+                                        <p class="pw_setting_hint" style="margin: 0 0 8px 0; padding-left: 0;">Describe only what this style should focus on. Pathweaver adds the shared rules and the output format automatically.</p>
                                         <textarea class="pw_editor_textarea" id="pw_edit_prompt" placeholder="Enter system prompt..."></textarea>
                                     </div>
                                 </div>
@@ -3134,7 +2834,7 @@ GUIDELINES:
                             <i class="fa-solid ${style.icon}"></i>
                         </div>
                         <div class="pw_style_info">
-                            <div class="pw_style_name">${style.name}</div>
+                            <div class="pw_style_name">${esc(style.name)}</div>
                             <div class="pw_style_type">Custom Style</div>
                         </div>
                         <div class="pw_style_actions">
@@ -3347,7 +3047,6 @@ GUIDELINES:
     async function openEditorView(styleId, isNew = false, isBuiltin = false) {
         const flipper = jQuery('#pw_manager_flipper');
         const nameInput = jQuery('#pw_edit_name');
-        const iconSelect = jQuery('#pw_edit_icon');
         const promptArea = jQuery('#pw_edit_prompt');
         const deleteBtn = jQuery('#pw_delete_style');
         const titleEl = jQuery('#pw_editor_title');
@@ -3486,41 +3185,20 @@ GUIDELINES:
         }
     }
 
-    function closeStyleEditor() {
-        closeStylesManager();
-    }
-
     // ============================================================
     // SURPRISE FEATURE
     // ============================================================
 
+    // Mirrors extension_prompt_types / extension_prompt_roles in SillyTavern's
+    // script.js. They are not exposed through getContext(), but the values are
+    // the same in upstream SillyTavern and SillyBunny.
+    const EXTENSION_PROMPT_TYPES = Object.freeze({ NONE: -1, IN_PROMPT: 0, IN_CHAT: 1, BEFORE_PROMPT: 2 });
+    const EXTENSION_PROMPT_ROLES = Object.freeze({ SYSTEM: 0, USER: 1, ASSISTANT: 2 });
+
     /**
-     * Inject a hidden prompt into the ST context at a given chat depth.
+     * Inject a hidden prompt into the chat context at a given depth.
      * Uses setExtensionPrompt so it is invisible to the user in the chat log.
      */
-    /**
-     * Resolve extension_prompt_types from ST context or window globals.
-     * ST exports these from script.js; they may be on the context object or window.
-     * Fallback to numeric constants: IN_CHAT=1, NONE=0
-     */
-    function getSurprisePromptTypes() {
-        const stContext = SillyTavern.getContext();
-        // Try context first (some ST versions expose them here)
-        if (stContext?.extension_prompt_types) return stContext.extension_prompt_types;
-        // Try window globals (ST may export them)
-        if (typeof window.extension_prompt_types !== 'undefined') return window.extension_prompt_types;
-        // Numeric fallback matching ST's enum values
-        return { NONE: 0, IN_CHAT: 1, BEFORE_PROMPT: 2, AFTER_PROMPT: 3 };
-    }
-
-    function getSurprisePromptRoles() {
-        const stContext = SillyTavern.getContext();
-        if (stContext?.extension_prompt_roles) return stContext.extension_prompt_roles;
-        if (typeof window.extension_prompt_roles !== 'undefined') return window.extension_prompt_roles;
-        // Numeric fallback: SYSTEM=0, USER=1, ASSISTANT=2
-        return { SYSTEM: 0, USER: 1, ASSISTANT: 2 };
-    }
-
     function injectSurprisePrompt(text, depth, key) {
         try {
             const stContext = SillyTavern.getContext();
@@ -3528,9 +3206,7 @@ GUIDELINES:
                 warn('setExtensionPrompt not available');
                 return false;
             }
-            const promptTypes = getSurprisePromptTypes();
-            const promptRoles = getSurprisePromptRoles();
-            stContext.setExtensionPrompt(key, text, promptTypes.IN_CHAT, depth, true, promptRoles.SYSTEM);
+            stContext.setExtensionPrompt(key, text, EXTENSION_PROMPT_TYPES.IN_CHAT, depth, true, EXTENSION_PROMPT_ROLES.SYSTEM);
             log('Surprise injected at depth', depth, 'key:', key, ':', text.substring(0, 80) + '...');
             return true;
         } catch (err) {
@@ -3544,8 +3220,7 @@ GUIDELINES:
         try {
             const stContext = SillyTavern.getContext();
             if (!stContext || typeof stContext.setExtensionPrompt !== 'function') return;
-            const promptTypes = getSurprisePromptTypes();
-            stContext.setExtensionPrompt(key, '', promptTypes.NONE, 0);
+            stContext.setExtensionPrompt(key, '', EXTENSION_PROMPT_TYPES.NONE, 0);
             log('Surprise prompt cleared:', key);
         } catch (err) {
             warn('Failed to clear surprise prompt:', err);
@@ -3604,7 +3279,7 @@ GUIDELINES:
                 ? `<span class="pw_sq_status pw_sq_firing"><i class="fa-solid fa-bolt"></i> Firing now</span>`
                 : `<span class="pw_sq_status"><i class="fa-solid fa-hourglass-half"></i> ~${remaining} msg${remaining !== 1 ? 's' : ''}</span>`;
             return `<li class="pw_sq_item">
-                <span class="pw_sq_cat"><i class="fa-solid ${cat.icon}"></i> ${cat.name}</span>
+                <span class="pw_sq_cat"><i class="fa-solid ${cat.icon}"></i> ${esc(cat.name)}</span>
                 ${statusHtml}
                 <button class="pw_sq_remove" data-surprise-index="${i}" title="Cancel this surprise">
                     <i class="fa-solid fa-xmark"></i>
@@ -3627,134 +3302,52 @@ GUIDELINES:
         jQuery('#pw_sm_surprise_clear_all').css('display', hasAny ? '' : 'none');
     }
 
+    /** Normalize the model's reply into a single "[System Note: ...]" line. */
+    function extractSystemNote(text) {
+        const cleaned = stripReasoning(text).replace(/<[^>]*>/g, '').trim();
+        const match = cleaned.match(/\[\s*System Note\s*:\s*([\s\S]*)\]/i);
+        let note = match ? match[1] : cleaned
+            // Drop a leading "emoji title" line if the model used the suggestion format
+            .replace(new RegExp(`^\\s*${EMOJI_PATTERN}[^\\n]*\\n`, 'u'), '')
+            .split(/\n\s*---/)[0];
+        note = stripMarkdown(note.replace(/^\s*System Note\s*:\s*/i, ''));
+        if (!note) return '';
+        return `[System Note: ${note.substring(0, 800)}]`;
+    }
+
     /**
-     * Generate a single hidden narrative event using the given category's system prompt.
-     * Returns the raw text string (not parsed into suggestion cards).
+     * Generate a single hidden narrative event using the given category as the style.
+     * Returns a "[System Note: ...]" string ready to inject.
      */
     async function generateSurpriseText(category, signal) {
-        const stContext = SillyTavern.getContext();
-        if (!stContext) throw new Error('SillyTavern context not available');
-
-        // Guard for the default (generateRaw) source — it shares the same backend
-        // pipeline as the main chat generation. If a generation is already in
-        // progress, abort immediately to prevent concurrent requests crashing
-        // local backends such as KoboldCPP.
-        if (settings.source === 'default' && isGenerating) {
-            throw new DOMException('Generation already in progress', 'AbortError');
+        // Pathweaver's own suggestion request shares the backend; don't overlap it
+        if (isGenerating || pendingMainApiRequest) {
+            throw new Error('Pathweaver is still generating suggestions. Try again when it finishes.');
         }
 
-        const storyContext = extractContext();
+        const storyContext = await extractContext();
         if (!storyContext) throw new Error('No active conversation found. Start a chat first.');
 
-        let categoryPrompt = await loadPrompt(category);
+        const stylePrompt = await loadPrompt(category);
+        const systemPrompt = buildSurpriseSystemPrompt(stylePrompt, storyContext);
+        const userPrompt = `[STORY CONTEXT]\n${buildContextBlock(storyContext)}\n\n[TASK]\nWrite the single hidden [System Note: ...] now.`;
+        const maxTokens = settings.reasoning_mode ? Math.max(settings.max_output_tokens || 8192, 1024) : 400;
 
-        // Macro substitution
-        const charName = storyContext.characterInfo.replace('Character: ', '') || 'Character';
-        const userName = stContext.name1 || 'User';
-        categoryPrompt = categoryPrompt
-            .replace(/{{char}}/g, charName)
-            .replace(/{{user}}/g, userName)
-            .replace(/{{model}}/g, charName);
-
-        let contextBlock = '';
-        if (storyContext.characterInfo) contextBlock += `${storyContext.characterInfo}\n\n`;
-        if (settings.include_scenario && storyContext.scenario) contextBlock += `Scenario: ${storyContext.scenario}\n\n`;
-        if (settings.include_description && storyContext.description) {
-            contextBlock += `Character Description: ${storyContext.description.substring(0, 5000)}\n\n`;
-        }
-        contextBlock += `Recent conversation:\n${storyContext.history}`;
-
-        const userPrompt = `[STORY CONTEXT]\n${contextBlock}\n\n[TASK]\nGenerate exactly ONE single, self-contained narrative event or development that could be secretly injected into this story. This will be used as a hidden system note that the AI will act upon at the right moment.\n\nWrite it as a concise system instruction (1-3 sentences) in the format:\n[System Note: <the secret event/development>]\n\nMake it specific, surprising, and narratively interesting. Do NOT include any preamble, explanation, or multiple options — just the single system note.`;
-
-        const calculatedMaxTokens = 300;
-        let result = '';
-
-        if (settings.source === 'profile' && settings.preset) {
-            const cm = stContext.extensionSettings?.connectionManager;
-            const profile = cm?.profiles?.find(p => p.name === settings.preset);
-            if (!profile) throw new Error(`Profile '${settings.preset}' not found`);
-            if (!stContext.ConnectionManagerRequestService) throw new Error('ConnectionManagerRequestService not available');
-
-            const messages = [
-                { role: 'system', content: categoryPrompt },
-                { role: 'user', content: userPrompt }
-            ];
-            const response = await stContext.ConnectionManagerRequestService.sendRequest(
-                profile.id, messages, calculatedMaxTokens,
-                { stream: false, signal, extractData: true, includePreset: true, includeInstruct: true }
-            );
-            if (response?.content) result = response.content;
-            else if (typeof response === 'string') result = response;
-            else if (response?.choices?.[0]?.message?.content) result = response.choices[0].message.content;
-            else result = JSON.stringify(response);
-
-        } else if (settings.source === 'ollama') {
-            const baseUrl = (settings.ollama_url || 'http://localhost:11434').replace(/\/$/, '');
-            if (!settings.ollama_model) throw new Error('No Ollama model selected');
-            const response = await fetch(`${baseUrl}/api/generate`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    model: settings.ollama_model,
-                    system: categoryPrompt,
-                    prompt: userPrompt,
-                    stream: false,
-                    options: { num_ctx: 4096, num_predict: calculatedMaxTokens }
-                }),
-                signal
-            });
-            if (!response.ok) throw new Error(`Ollama API error: ${response.status}`);
-            const data = await response.json();
-            result = data.response || '';
-
-        } else if (settings.source === 'openai') {
-            const baseUrl = (settings.openai_url || 'http://localhost:1234/v1').replace(/\/$/, '');
-            const headers = { 'Content-Type': 'application/json' };
-            if (settings.openai_key) headers['Authorization'] = `Bearer ${settings.openai_key}`;
-            const response = await fetch(`${baseUrl}/chat/completions`, {
-                method: 'POST',
-                headers,
-                body: JSON.stringify({
-                    model: settings.openai_model || 'local-model',
-                    messages: [
-                        { role: 'system', content: categoryPrompt },
-                        { role: 'user', content: userPrompt }
-                    ],
-                    temperature: 0.9,
-                    max_tokens: calculatedMaxTokens,
-                    stream: false
-                }),
-                signal
-            });
-            if (!response.ok) throw new Error(`API error: ${response.status}`);
-            const data = await response.json();
-            result = data.choices?.[0]?.message?.content || '';
-
-        } else {
-            const { generateRaw } = stContext;
-            if (!generateRaw) throw new Error('generateRaw not available in context');
-            const abortPromise = new Promise((_, reject) => {
-                if (signal) signal.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')));
-            });
-            result = await Promise.race([
-                generateRaw({ systemPrompt: categoryPrompt, prompt: userPrompt, streaming: false }),
-                abortPromise
-            ]);
-        }
-
-        // Clean up the result
-        result = result
-            .replace(/<(thought|think|thinking|reasoning|reason)>[\s\S]*?<\/\1>/gi, '')
-            .trim();
-
-        if (!result) throw new Error('No content generated');
-        return result;
+        const result = await requestCompletion({ systemPrompt, userPrompt, maxTokens, signal, temperature: 0.9 });
+        const note = extractSystemNote(result);
+        if (!note) throw new Error('No content generated');
+        return note;
     }
 
     /**
      * Show the Surprise modal: style picker → processing → confirmation.
      */
     function showSurpriseModal(category) {
+        if (surpriseAbortController) {
+            showToast('A surprise is already being prepared.', 'warning');
+            return;
+        }
+
         // Remove any existing surprise modal
         jQuery('#pw_surprise_modal').remove();
 
@@ -3862,24 +3455,7 @@ GUIDELINES:
 
             if (signal.aborted) return;
 
-            // Pick how many NEW messages must pass before the surprise triggers
-            const dMin = Math.max(1, Math.min(12, settings.surprise_depth_min || 2));
-            const dMax = Math.max(dMin, Math.min(12, settings.surprise_depth_max || 6));
-            const triggerAfter = settings.surprise_randomize
-                ? Math.floor(Math.random() * (dMax - dMin + 1)) + dMin
-                : dMin;
-
-            // Record current chat length so we can count new messages from here
-            const stContext = SillyTavern.getContext();
-            const baseMessageCount = stContext?.chat?.length ?? 0;
-            const key = `pathweaver_surprise_${surpriseKeyCounter++}`;
-
-            activeSurprises.push({ key, category, triggerAfter, baseMessageCount, text, injected: false });
-            saveSurpriseQueue();
-
-            // Update bar and queue display
-            createActionBar();
-            renderSurpriseQueue();
+            armSurprise(category, text);
 
             // Show done state
             jQuery('#pw_surprise_processing').hide();
@@ -3906,6 +3482,7 @@ GUIDELINES:
                 runSurpriseGeneration(category, modal);
             });
         } finally {
+            await waitForMainApiRequest();
             surpriseAbortController = null;
         }
     }
@@ -3919,6 +3496,7 @@ GUIDELINES:
             const response = await fetch(`${BASE_URL}/settings.html`);
             if (response.ok) {
                 const html = await response.text();
+                jQuery('#pathweaver_settings').remove();
                 jQuery('#extensions_settings').append(html);
                 log('Settings panel loaded');
 
@@ -3985,7 +3563,7 @@ GUIDELINES:
         if (models.length) {
             models.forEach(m => {
                 const selected = settings.ollama_model === m.name ? ' selected' : '';
-                select.append(`<option value="${m.name}"${selected}>${m.name}</option>`);
+                select.append(`<option value="${esc(m.name)}"${selected}>${esc(m.name)}</option>`);
             });
             // Auto-select first if none selected
             if (!settings.ollama_model && models.length) {
@@ -3995,6 +3573,21 @@ GUIDELINES:
             }
         } else {
             select.append('<option value="">No models found</option>');
+        }
+    }
+
+    const OPENAI_PRESETS = Object.freeze({
+        lmstudio: { url: 'http://localhost:1234/v1', model: 'local-model' },
+        kobold: { url: 'http://localhost:5001/v1', model: 'koboldcpp' },
+        textgen: { url: 'http://localhost:5000/v1', model: 'local-model' },
+        vllm: { url: 'http://localhost:8000/v1', model: 'local-model' },
+    });
+
+    function applyOpenAIPreset(preset) {
+        settings.openai_preset = preset;
+        if (OPENAI_PRESETS[preset]) {
+            settings.openai_url = OPENAI_PRESETS[preset].url;
+            settings.openai_model = OPENAI_PRESETS[preset].model;
         }
     }
 
@@ -4035,11 +3628,7 @@ GUIDELINES:
         // Reasoning mode settings
         jQuery('#pw_reasoning_mode').prop('checked', settings.reasoning_mode);
         jQuery('#pw_max_output_tokens').val(settings.max_output_tokens || 16384);
-        if (settings.reasoning_mode) {
-            jQuery('#pw_max_output_tokens_row').show();
-        } else {
-            jQuery('#pw_max_output_tokens_row').hide();
-        }
+        jQuery('#pw_max_output_tokens_row, #pw_max_output_tokens_hint').toggle(!!settings.reasoning_mode);
         // Surprise Me
         jQuery('#pw_surprise_randomize').prop('checked', settings.surprise_randomize);
         jQuery('#pw_surprise_endless').prop('checked', settings.surprise_endless);
@@ -4062,6 +3651,7 @@ GUIDELINES:
         jQuery('#pw_sm_profile').val(settings.preset);
         jQuery('#pw_sm_ollama_url').val(settings.ollama_url);
         jQuery('#pw_sm_ollama_model').val(settings.ollama_model);
+        jQuery('#pw_sm_openai_preset').val(settings.openai_preset);
         jQuery('#pw_sm_openai_url').val(settings.openai_url);
         jQuery('#pw_sm_openai_model').val(settings.openai_model);
         jQuery('#pw_sm_openai_key').val(settings.openai_key);
@@ -4107,12 +3697,8 @@ GUIDELINES:
 
         // Reasoning mode settings
         jQuery('.pw_toggle[data-setting="reasoning_mode"]').toggleClass('active', settings.reasoning_mode);
-        jQuery('#pw_max_output_tokens').val(settings.max_output_tokens || 16384);
-        if (settings.reasoning_mode) {
-            jQuery('#pw_max_output_tokens_row').show();
-        } else {
-            jQuery('#pw_max_output_tokens_row').hide();
-        }
+        jQuery('#pw_modal_max_output_tokens').val(settings.max_output_tokens || 16384);
+        jQuery('#pw_modal_max_tokens_row, #pw_modal_max_tokens_hint').toggle(!!settings.reasoning_mode);
 
         // Update provider visibility
         jQuery('#pw_sm_profile_box, #pw_sm_ollama_box, #pw_sm_openai_box').hide();
@@ -4166,20 +3752,11 @@ GUIDELINES:
 
         // OpenAI preset
         jQuery('#pw_openai_preset').on('change', function () {
-            settings.openai_preset = this.value;
-            const presets = {
-                lmstudio: { url: 'http://localhost:1234/v1', model: 'local-model' },
-                kobold: { url: 'http://localhost:5001/v1', model: 'koboldcpp' },
-                textgen: { url: 'http://localhost:5000/v1', model: 'local-model' },
-                vllm: { url: 'http://localhost:8000/v1', model: 'local-model' }
-            };
-            if (presets[this.value]) {
-                settings.openai_url = presets[this.value].url;
-                settings.openai_model = presets[this.value].model;
-                jQuery('#pw_openai_url').val(settings.openai_url);
-                jQuery('#pw_openai_model').val(settings.openai_model);
-            }
+            applyOpenAIPreset(this.value);
+            jQuery('#pw_openai_url').val(settings.openai_url);
+            jQuery('#pw_openai_model').val(settings.openai_model);
             saveSettings();
+            syncSettingsToModal();
         });
 
         // OpenAI URL
@@ -4205,7 +3782,7 @@ GUIDELINES:
 
         // Suggestions count
         jQuery('#pw_suggestions_count').on('change', function () {
-            settings.suggestions_count = Math.max(1, Math.min(20, parseInt(this.value) || 10));
+            settings.suggestions_count = Math.max(1, Math.min(20, parseInt(this.value) || 6));
             this.value = settings.suggestions_count;
             saveSettings();
             syncSettingsToModal();
@@ -4213,7 +3790,7 @@ GUIDELINES:
 
         // Context depth
         jQuery('#pw_context_depth').on('change', function () {
-            settings.context_depth = parseInt(this.value) || 4;
+            settings.context_depth = parseInt(this.value) || 8;
             saveSettings();
             syncSettingsToModal();
         });
@@ -4320,11 +3897,7 @@ GUIDELINES:
             saveSettings();
             syncSettingsToModal();
             // Show/hide max_output_tokens setting based on reasoning mode
-            if (this.checked) {
-                jQuery('#pw_max_output_tokens_row').show();
-            } else {
-                jQuery('#pw_max_output_tokens_row').hide();
-            }
+            jQuery('#pw_max_output_tokens_row, #pw_max_output_tokens_hint').toggle(this.checked);
         });
 
         // Max output tokens
@@ -4359,7 +3932,7 @@ GUIDELINES:
 
         // Open Style Editor from settings
         jQuery('#pw_open_editor_settings').on('click', function () {
-            openStyleEditor();
+            openStylesManager();
         });
 
         // Surprise Me: endless toggle
@@ -4438,8 +4011,6 @@ GUIDELINES:
                 showToast('Surprise removed.');
             }
         });
-
-        createActionBar();
     }
 
     // ============================================================
@@ -4465,43 +4036,55 @@ GUIDELINES:
 
     const handleMessageSent = () => {
         jQuery('.pw_action_bar').addClass('pw_processing');
+        // The user's message counts toward armed surprises; one that becomes due
+        // now is injected in time for the reply being generated.
+        checkSurpriseTrigger({ replyReceived: false });
+    };
+
+    const handleMessageReceived = (_messageId, type) => {
+        if (type === 'first_message') return;
+        checkSurpriseTrigger({ replyReceived: true });
     };
 
     const handleGenerationEnded = () => {
         jQuery('.pw_action_bar').removeClass('pw_processing');
+        // The chat changed, so cached suggestions are stale
         cachedSuggestions = {};
-        checkSurpriseTrigger();
     };
 
-    function checkSurpriseTrigger() {
+    /**
+     * Advance armed surprises. Driven by chat messages rather than generation
+     * events, so quiet/background generations (summaries, other extensions)
+     * don't count and can't use up an injected surprise.
+     */
+    function checkSurpriseTrigger({ replyReceived }) {
         if (!activeSurprises.length) return;
 
         const stContext = SillyTavern.getContext();
         const currentCount = stContext?.chat?.length ?? 0;
         let changed = false;
 
-        for (let i = activeSurprises.length - 1; i >= 0; i--) {
-            const s = activeSurprises[i];
-            const newMessages = currentCount - s.baseMessageCount;
-
-            if (s.injected) {
+        // A surprise injected before this reply has now been used by it
+        if (replyReceived) {
+            for (let i = activeSurprises.length - 1; i >= 0; i--) {
+                const s = activeSurprises[i];
+                if (!s.injected) continue;
                 clearSurprisePrompt(s.key);
-                const firedCategory = s.category; // capture before splice
                 activeSurprises.splice(i, 1);
                 changed = true;
                 log('Surprise', s.key, 'cleared after firing');
+                if (settings.surprise_endless) scheduleEndlessSurprise(s.category);
+            }
+        }
 
-                // Endless Surprises: silently queue a fresh one with the same style
-                if (settings.surprise_endless) {
-                    scheduleEndlessSurprise(firedCategory);
-                }
-            } else if (newMessages >= s.triggerAfter) {
-                const ok = injectSurprisePrompt(s.text, 1, s.key);
-                if (ok) {
-                    s.injected = true;
-                    changed = true;
-                    log('Surprise', s.key, 'triggered after', newMessages, 'new messages');
-                }
+        // Inject any surprise that is now due; it applies to the next reply
+        for (const s of activeSurprises) {
+            if (s.injected) continue;
+            const newMessages = currentCount - s.baseMessageCount;
+            if (newMessages >= s.triggerAfter && injectSurprisePrompt(s.text, 1, s.key)) {
+                s.injected = true;
+                changed = true;
+                log('Surprise', s.key, 'triggered after', newMessages, 'new messages');
             }
         }
 
@@ -4512,51 +4095,52 @@ GUIDELINES:
         }
     }
 
+    function pickSurpriseDelay() {
+        const dMin = Math.max(1, Math.min(12, settings.surprise_depth_min || 2));
+        const dMax = Math.max(dMin, Math.min(12, settings.surprise_depth_max || 6));
+        return settings.surprise_randomize
+            ? Math.floor(Math.random() * (dMax - dMin + 1)) + dMin
+            : dMin;
+    }
+
+    function armSurprise(category, text) {
+        const stContext = SillyTavern.getContext();
+        const triggerAfter = pickSurpriseDelay();
+        activeSurprises.push({
+            key: `pathweaver_surprise_${surpriseKeyCounter++}`,
+            category,
+            triggerAfter,
+            baseMessageCount: stContext?.chat?.length ?? 0,
+            text,
+            injected: false,
+        });
+        saveSurpriseQueue();
+        renderSurpriseQueue();
+        createActionBar();
+        return triggerAfter;
+    }
+
     /**
      * Silently generate and arm a new surprise for the given category.
-     * Used by Endless Surprises to keep the queue perpetually loaded
-     * without interrupting the user.
-     * A 4-second delay is intentional — it lets KoboldCPP (and other local
-     * backends) fully release CUDA/GPU resources before a second request
-     * arrives, preventing concurrent-request crashes.
+     * Used by Endless Surprises to keep the queue loaded without interrupting
+     * the user. It waits until neither SillyTavern nor Pathweaver is generating,
+     * plus a few seconds so local backends (KoboldCPP, Ollama, ...) can release
+     * GPU resources, because concurrent requests can crash them.
      */
     async function scheduleEndlessSurprise(category) {
-        log('Endless Surprises: scheduling background surprise for category', category);
+        const chatIdAtStart = SillyTavern.getContext()?.chatId;
+        const stillWanted = () => settings.surprise_endless && SillyTavern.getContext()?.chatId === chatIdAtStart;
+        const isBusy = () => isGenerating || isHostGenerating() || surpriseAbortController !== null || pendingMainApiRequest !== null;
 
-        // Guard: never fire a background generation while the main pipeline is active.
-        if (isGenerating) {
-            log('Endless Surprises: skipping — main generation in progress');
-            return;
-        }
         try {
-            // Delay before re-arming so local backends (KoboldCPP, Ollama, etc.)
-            // have time to fully release GPU/CUDA resources after the last response.
-            await new Promise(resolve => setTimeout(resolve, 4000));
+            do {
+                await new Promise(resolve => setTimeout(resolve, 4000));
+                if (!stillWanted()) return;
+            } while (isBusy());
 
-            // Re-check after the delay in case a new generation started during the wait.
-            if (isGenerating) {
-                log('Endless Surprises: skipping after delay — main generation started');
-                return;
-            }
-
-            const endlessAbort = new AbortController();
-            const text = await generateSurpriseText(category, endlessAbort.signal);
-
-            const dMin = Math.max(1, Math.min(12, settings.surprise_depth_min || 2));
-            const dMax = Math.max(dMin, Math.min(12, settings.surprise_depth_max || 6));
-            const triggerAfter = settings.surprise_randomize
-                ? Math.floor(Math.random() * (dMax - dMin + 1)) + dMin
-                : dMin;
-
-            const stContext = SillyTavern.getContext();
-            const baseMessageCount = stContext?.chat?.length ?? 0;
-            const key = `pathweaver_surprise_${surpriseKeyCounter++}`;
-
-            activeSurprises.push({ key, category, triggerAfter, baseMessageCount, text, injected: false });
-            saveSurpriseQueue();
-            renderSurpriseQueue();
-            createActionBar();
-
+            const text = await generateSurpriseText(category, new AbortController().signal);
+            if (!stillWanted()) return;
+            const triggerAfter = armSurprise(category, text);
             log('Endless Surprises: new surprise armed for category', category, '— fires in', triggerAfter, 'messages');
         } catch (err) {
             if (err.name === 'AbortError') return;
@@ -4578,7 +4162,9 @@ GUIDELINES:
         eventSource.on(event_types.CHAT_CHANGED, handleChatChanged);
         eventSource.on(event_types.SETTINGS_UPDATED, handleSettingsUpdated);
         eventSource.on(event_types.MESSAGE_SENT, handleMessageSent);
+        eventSource.on(event_types.MESSAGE_RECEIVED, handleMessageReceived);
         eventSource.on(event_types.GENERATION_ENDED, handleGenerationEnded);
+        eventSource.on(event_types.GENERATION_STOPPED, handleGenerationEnded);
     }
 
     // Expose cleanup function for hot reload
@@ -4590,18 +4176,21 @@ GUIDELINES:
         eventSource.removeListener(event_types.CHAT_CHANGED, handleChatChanged);
         eventSource.removeListener(event_types.SETTINGS_UPDATED, handleSettingsUpdated);
         eventSource.removeListener(event_types.MESSAGE_SENT, handleMessageSent);
+        eventSource.removeListener(event_types.MESSAGE_RECEIVED, handleMessageReceived);
         eventSource.removeListener(event_types.GENERATION_ENDED, handleGenerationEnded);
+        eventSource.removeListener(event_types.GENERATION_STOPPED, handleGenerationEnded);
 
         // Remove Document listeners
         jQuery(document).off('mousedown.pathweaver');
         jQuery(document).off('keydown.pathweaver_suggestions');
-        jQuery(document).off('click.pw_dropdown_close');
+        jQuery(document).off('.pw_action_bar_events');
         jQuery(document).off('click.pw_icon_dd');
         jQuery(document).off('click.pw_icon_dd_outside');
         jQuery(document).off('input.pw_icon_search');
         jQuery(document).off('click.pw_icon_grid');
         jQuery('body').removeClass('pw_icon_dd_open');
-        jQuery('body').removeClass('pw_icon_dd_open');
+        if (barResizeObserver) barResizeObserver.disconnect();
+        window.removeEventListener('resize', checkBarWidth);
 
         // Remove UI elements
         jQuery('.pw_action_bar').remove();
@@ -4610,6 +4199,7 @@ GUIDELINES:
         jQuery('#pw_styles_manager').remove();
         jQuery('#pw_director_modal').remove();
         jQuery('#pw_surprise_modal').remove();
+        jQuery('#pathweaver_settings').remove();
 
         // Clear any active surprise injections (leave chatMetadata intact for restore on next init)
         try {
@@ -4666,4 +4256,3 @@ GUIDELINES:
     }
 
 })();
-// TEST APPEND
