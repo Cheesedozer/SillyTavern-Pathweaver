@@ -3743,3 +3743,49 @@ details[open] .pw_surprise_queue_chevron {
         flex-shrink: 0 !important;
     }
 }
+
+/* ============================================================
+   TIME SKIP
+   ============================================================ */
+
+.pw_timeskip_btn.active {
+    border-color: var(--pw-accent);
+    color: var(--pw-accent);
+    background: color-mix(in srgb, var(--pw-accent) 15%, transparent);
+    box-shadow: 0 0 10px var(--pw-accent-glow);
+    animation: pw_timeskip_glow 2.4s ease-in-out infinite;
+}
+
+@keyframes pw_timeskip_glow {
+    0%, 100% { box-shadow: 0 0 6px var(--pw-accent-glow); }
+    50%       { box-shadow: 0 0 14px var(--pw-accent-glow); }
+}
+
+/* Styles without a time-skip variant while Time Skip is on */
+.pw_cat_btn.pw_timeskip_blocked,
+.pw_dropdown_item.pw_timeskip_blocked {
+    opacity: 0.35;
+    filter: grayscale(1);
+}
+
+.pw_cat_btn.pw_timeskip_blocked:hover {
+    transform: none;
+    box-shadow: none;
+    border-width: 1px;
+    border-color: var(--pw-glass-border);
+    color: var(--pw-text-secondary);
+}
+
+.pw_timeskip_check {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0 !important;
+    cursor: pointer;
+    color: var(--pw-text-primary, inherit);
+}
+
+.pw_timeskip_check input {
+    margin: 0;
+    cursor: pointer;
+}
