@@ -130,6 +130,18 @@
     color: white;
 }
 
+/* SillyBunny: its chat bar sits right above ours, so keep the minimize
+   button inside the bar instead of as a tab sticking out over that bar. */
+.pw_action_bar.pw_host_sillybunny:not(.minimized) .pw_minimize_btn {
+    position: static;
+    transform: none;
+    order: 99;
+    flex-shrink: 0;
+    width: 28px;
+    height: 28px;
+    border-radius: 8px;
+}
+
 /* ============================================================
    BAR SIZE VARIANTS
    ============================================================ */
