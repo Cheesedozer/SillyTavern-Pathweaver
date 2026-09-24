@@ -42,6 +42,7 @@
 - **Director Mode**: Single Scene or Story Beats for precise control
 - **Surprise Me**: Adds a hidden suggestion that triggers later in the story/roleplay
 - **Genre Specialization**: 9 built-in genres + unlimited custom styles
+- **Time Skip**: Turn on a time-skip variant per style, then use the ⏳ button in the bar to get suggestions that jump ahead in time
 
 </td>
 <td width="50%">

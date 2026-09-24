@@ -124,6 +124,7 @@
         include_description: true,  // Include character description in context
         include_worldinfo: false,   // Include World Info lorebook in context
         custom_styles: [],
+        time_skip_styles: [],       // style ids that have the time-skip variant enabled
         hide_animated_bar: false,
         surprise_depth_min: 2,      // minimum messages away (used for random range or fixed min)
         surprise_depth_max: 6,      // maximum messages away (used for random range or fixed max)
@@ -145,6 +146,7 @@
     let barResizeObserver = null;
     let pendingMainApiRequest = null; // Main API request still running after a cancel
     let directorMode = 'single_scene'; // 'single_scene' or 'story_beats'
+    let timeSkipMode = false; // toolbar Time Skip toggle; runtime only, resets on reload and chat change
 
     // Suggestion cache
     let cachedSuggestions = {};
@@ -224,6 +226,23 @@
         }
 
         return categories;
+    }
+
+    function hasTimeSkipVariant(category) {
+        return !!settings.time_skip_styles?.includes(category);
+    }
+
+    /** True when at least one style shown in the bar has its time-skip variant enabled. */
+    function hasVisibleTimeSkipStyles() {
+        const allCategories = getAllCategories();
+        return (settings.time_skip_styles || []).some(id => {
+            const cat = allCategories[id];
+            return cat && (!cat.nsfw || settings.show_explicit);
+        });
+    }
+
+    function getSuggestionCacheKey(category, timeSkip) {
+        return timeSkip ? `${category}::timeskip` : category;
     }
 
     // ============================================================
@@ -410,14 +429,20 @@
             : 'Each description is 2-3 sentences.';
     }
 
-    function buildSuggestionSystemPrompt(stylePrompt, storyContext) {
+    const CONTINUITY_RULES = `- Continue from the exact moment the last message ends. Each suggestion is a plausible next beat from there, not a later scene or a summary of a whole arc.
+- Anchor every suggestion in something specific from the recent messages: a person, object, place, line of dialogue, or unfinished action.`;
+
+    const TIME_SKIP_RULES = `- Each suggestion skips ahead in time from the current moment and opens a new scene where the skip ends. Begin every description with an explicit time marker (for example "Three days later," or "By the first snowfall,").
+- Vary the length of the skips across the suggestions, from a few hours to weeks or longer. Base each skip on something from the story that needs time to pass: a journey, healing, a deadline, a promised meeting, an unresolved thread.
+- You may briefly and neutrally summarize what happened during the gap, but do not decide how other established characters felt or what they chose.`;
+
+    function buildSuggestionSystemPrompt(stylePrompt, storyContext, timeSkip = false) {
         const prompt = `You write suggestions for what could happen next in an ongoing roleplay story between {{user}} (the user) and {{char}}. {{user}} will choose one suggestion and send its description as their next message.
 
 ${stylePrompt.trim()}
 
 RULES:
-- Continue from the exact moment the last message ends. Each suggestion is a plausible next beat from there, not a later scene or a summary of a whole arc.
-- Anchor every suggestion in something specific from the recent messages: a person, object, place, line of dialogue, or unfinished action.
+${timeSkip ? TIME_SKIP_RULES : CONTINUITY_RULES}
 - Stay consistent with established facts, the characters' personalities and relationships, the setting, and the story's current tone. Only use world details that appear in the provided context.
 - Make the suggestions clearly different from each other: vary who acts, what changes, and where the scene goes. Never write several versions of the same idea.
 - Use plain, specific language. Prefer a concrete action or an actual line of dialogue over mood, atmosphere, or abstract summary.
@@ -690,7 +715,7 @@ OUTPUT FORMAT: exactly one line and nothing else:
         return profile;
     }
 
-    function buildSuggestionTask(category, customDirections, mode) {
+    function buildSuggestionTask(category, customDirections, mode, timeSkip = false) {
         const count = settings.suggestions_count;
         if (category === 'director' && customDirections?.length) {
             const dirList = customDirections.map((d, i) => `${i + 1}. ${d}`).join('\n');
@@ -707,12 +732,13 @@ OUTPUT FORMAT: exactly one line and nothing else:
         }
         return {
             count,
-            task: `Write exactly ${count} suggestions. ${getLengthRule()}`,
+            task: `Write exactly ${count} ${timeSkip ? 'time-skip ' : ''}suggestions. ${getLengthRule()}`,
         };
     }
 
-    async function generateSuggestions(category, forceRefresh = false, customDirections = null, mode = 'single_scene', outputContainer = null) {
-        log('Generating suggestions for:', category);
+    async function generateSuggestions(category, forceRefresh = false, customDirections = null, mode = 'single_scene', outputContainer = null, timeSkip = false) {
+        log('Generating suggestions for:', category, timeSkip ? '(time skip)' : '');
+        const cacheKey = getSuggestionCacheKey(category, timeSkip);
 
         if (isGenerating) {
             showToast('Pathweaver is still finishing the previous request.', 'warning');
@@ -728,8 +754,8 @@ OUTPUT FORMAT: exactly one line and nothing else:
                 cachedSuggestions = {};
                 cachedChatId = chatId;
             }
-            if (!forceRefresh && cachedSuggestions[category]) {
-                displaySuggestions(cachedSuggestions[category], category, outputContainer);
+            if (!forceRefresh && cachedSuggestions[cacheKey]) {
+                displaySuggestions(cachedSuggestions[cacheKey], category, outputContainer);
                 return;
             }
         }
@@ -747,8 +773,8 @@ OUTPUT FORMAT: exactly one line and nothing else:
             }
 
             const stylePrompt = await loadPrompt(category);
-            const systemPrompt = buildSuggestionSystemPrompt(stylePrompt, storyContext);
-            const { count, task } = buildSuggestionTask(category, customDirections, mode);
+            const systemPrompt = buildSuggestionSystemPrompt(stylePrompt, storyContext, timeSkip);
+            const { count, task } = buildSuggestionTask(category, customDirections, mode, timeSkip);
             const userPrompt = `[STORY CONTEXT]\n${buildContextBlock(storyContext)}\n\n[TASK]\n${task}`;
             const maxTokens = getSuggestionMaxTokens(count);
             log(`Max tokens: ${maxTokens}`);
@@ -763,6 +789,7 @@ OUTPUT FORMAT: exactly one line and nothing else:
                         userPrompt,
                         maxTokens,
                         category,
+                        cacheKey,
                         outputContainer,
                         signal,
                         maxSuggestions: count,
@@ -780,7 +807,7 @@ OUTPUT FORMAT: exactly one line and nothing else:
             if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
 
             const suggestions = await parseSuggestions(result, count);
-            if (category !== 'director' && suggestions.length) cachedSuggestions[category] = suggestions;
+            if (category !== 'director' && suggestions.length) cachedSuggestions[cacheKey] = suggestions;
             displaySuggestions(suggestions, category, outputContainer);
         } catch (err) {
             if (err.name === 'AbortError' || signal.aborted) {
@@ -1052,7 +1079,7 @@ OUTPUT FORMAT: exactly one line and nothing else:
         handleLine(buffer);
     }
 
-    async function runStreamingGeneration({ source, systemPrompt, userPrompt, maxTokens, category, outputContainer, signal, maxSuggestions }) {
+    async function runStreamingGeneration({ source, systemPrompt, userPrompt, maxTokens, category, cacheKey = category, outputContainer, signal, maxSuggestions }) {
         const body = outputContainer || jQuery('#pw_modal_body');
         const suggestionsArray = [];
         let contentBuffer = '';
@@ -1156,7 +1183,7 @@ OUTPUT FORMAT: exactly one line and nothing else:
 
         body.find('.pw_status').remove();
         if (suggestionsArray.length > 0) {
-            if (category !== 'director') cachedSuggestions[category] = suggestionsArray;
+            if (category !== 'director') cachedSuggestions[cacheKey] = suggestionsArray;
         } else {
             showEmptyState('No suggestions could be generated. Try again.', outputContainer);
         }
@@ -1178,6 +1205,13 @@ OUTPUT FORMAT: exactly one line and nothing else:
         }
 
         const allCategories = getAllCategories();
+
+        // Time Skip mode: styles without the variant are dimmed and blocked while it's on
+        const showTimeSkipBtn = hasVisibleTimeSkipStyles();
+        if (!showTimeSkipBtn) timeSkipMode = false;
+        const isTimeSkipBlocked = key => timeSkipMode && !hasTimeSkipVariant(key);
+        const blockedClass = key => isTimeSkipBlocked(key) ? ' pw_timeskip_blocked' : '';
+        const disabledAttr = key => isTimeSkipBlocked(key) ? ' disabled' : '';
 
         // 4. Surprise Dropdown (built first so it can be inserted right after Director)
         const surpriseStyles = [
@@ -1246,7 +1280,7 @@ OUTPUT FORMAT: exactly one line and nothing else:
             const bIcon = allCategories[key]?.icon || cat.icon;
 
             const btnHtml = `
-                <button class="pw_cat_btn"
+                <button class="pw_cat_btn${blockedClass(key)}"
                         data-category="${key}"
                         data-name="${cat.name}"
                         title="${cat.name}: ${cat.tooltip}">
@@ -1254,7 +1288,7 @@ OUTPUT FORMAT: exactly one line and nothing else:
                 </button>`;
 
             builtinButtonsHtml += btnHtml;
-            categoryOptionsHtml += `<option value="${key}">${cat.name}</option>`;
+            categoryOptionsHtml += `<option value="${key}"${disabledAttr(key)}>${cat.name}</option>`;
         }
 
         // 2. Custom Styles (Combined Dropdown)
@@ -1263,12 +1297,12 @@ OUTPUT FORMAT: exactly one line and nothing else:
             let customItems = '';
             for (const style of settings.custom_styles) {
                 customItems += `
-                    <button class="pw_dropdown_item" data-category="${style.id}">
+                    <button class="pw_dropdown_item${blockedClass(style.id)}" data-category="${style.id}">
                         <i class="fa-solid ${style.icon}"></i>
                         <span>${esc(style.name)}</span>
                     </button>`;
                 // Also add to the mobile/fallback select
-                categoryOptionsHtml += `<option value="${style.id}">${esc(style.name)}</option>`;
+                categoryOptionsHtml += `<option value="${style.id}"${disabledAttr(style.id)}>${esc(style.name)}</option>`;
             }
 
             customDropdownHtml = `
@@ -1292,12 +1326,12 @@ OUTPUT FORMAT: exactly one line and nothing else:
             if (cat.nsfw && !settings.show_explicit) continue;
             const gIcon = allCategories[key]?.icon || cat.icon;
             genreItems += `
-                <button class="pw_dropdown_item" data-category="${key}">
+                <button class="pw_dropdown_item${blockedClass(key)}" data-category="${key}">
                     <i class="fa-solid ${gIcon}"></i>
                     <span>${cat.name}</span>
                 </button>`;
 
-            categoryOptionsHtml += `<option value="${key}">${cat.name}</option>`;
+            categoryOptionsHtml += `<option value="${key}"${disabledAttr(key)}>${cat.name}</option>`;
             hasVisibleGenres = true;
         }
 
@@ -1338,6 +1372,12 @@ OUTPUT FORMAT: exactly one line and nothing else:
             </select>
             <div class="pw_bar_right">
                 <span class="pw_hover_label" id="pw_hover_label"></span>
+                ${showTimeSkipBtn ? `<button class="pw_icon_btn pw_timeskip_btn${timeSkipMode ? ' active' : ''}" id="pw_bar_timeskip"
+                        data-name="${timeSkipMode ? 'Time Skip: On' : 'Time Skip: Off'}"
+                        title="Time Skip: ${timeSkipMode ? 'on. Suggestions jump ahead in time. Click to turn off.' : 'off. Click to make suggestions jump ahead in time.'}"
+                        aria-pressed="${timeSkipMode}">
+                    <i class="fa-solid fa-hourglass-half"></i>
+                </button>` : ''}
                 <button class="pw_icon_btn" id="pw_bar_settings" title="Pathweaver Settings">
                     <i class="fa-solid fa-gear"></i>
                 </button>
@@ -1394,7 +1434,7 @@ OUTPUT FORMAT: exactly one line and nothing else:
                 showDirectorModal();
                 return;
             }
-            openSuggestionsModal(category);
+            openStyleFromBar(category);
         });
 
         // 2. Dropdown Toggles
@@ -1428,7 +1468,7 @@ OUTPUT FORMAT: exactly one line and nothing else:
             jQuery('.pw_dropdown_btn').removeClass('active');
 
             if (category) {
-                openSuggestionsModal(category);
+                openStyleFromBar(category);
             }
         });
 
@@ -1450,24 +1490,30 @@ OUTPUT FORMAT: exactly one line and nothing else:
                 } else if (category === 'director') {
                     showDirectorModal();
                 } else {
-                    openSuggestionsModal(category);
+                    openStyleFromBar(category);
                 }
                 this.selectedIndex = 0; // Reset
             }
         });
 
         // 7. Hover Labels (Delegated)
-        jQuery(document).on(`mouseenter${eventNs}`, '.pw_cat_btn, .pw_dropdown_btn', function () {
+        jQuery(document).on(`mouseenter${eventNs}`, '.pw_cat_btn, .pw_dropdown_btn, .pw_timeskip_btn', function () {
             const name = jQuery(this).data('name');
             if (name) {
                 jQuery('#pw_hover_label').text(name).addClass('visible');
             }
-        }).on(`mouseleave${eventNs}`, '.pw_cat_btn, .pw_dropdown_btn', function () {
+        }).on(`mouseleave${eventNs}`, '.pw_cat_btn, .pw_dropdown_btn, .pw_timeskip_btn', function () {
             jQuery('#pw_hover_label').removeClass('visible');
         });
 
         // 6. Settings & Minimize
         jQuery(document).on(`click${eventNs}`, '#pw_bar_settings', openSettingsModal);
+
+        jQuery(document).on(`click${eventNs}`, '#pw_bar_timeskip', function () {
+            timeSkipMode = !timeSkipMode;
+            createActionBar();
+            showToast(timeSkipMode ? 'Time Skip on' : 'Time Skip off');
+        });
 
         jQuery(document).on(`click${eventNs} touchend${eventNs}`, '#pw_minimize_bar', function (e) {
             // touchend: prevent the double-fire from the subsequent synthetic click
@@ -1823,7 +1869,7 @@ OUTPUT FORMAT: exactly one line and nothing else:
         jQuery('#pw_close_suggestions').on('click', closeSuggestionsModal);
         jQuery('#pw_refresh_btn').on('click', () => {
             const category = suggestionsModal.data('category');
-            if (category) generateSuggestions(category, true);
+            if (category) generateSuggestions(category, true, null, 'single_scene', null, !!suggestionsModal.data('timeSkip'));
         });
 
         suggestionsModal.on('click', (e) => {
@@ -1845,7 +1891,17 @@ OUTPUT FORMAT: exactly one line and nothing else:
         });
     }
 
-    function openSuggestionsModal(category) {
+    /** Opens a style clicked in the bar, honoring the Time Skip toggle. */
+    function openStyleFromBar(category) {
+        if (timeSkipMode && !hasTimeSkipVariant(category)) {
+            const name = getAllCategories()[category]?.name || category;
+            showToast(`Time skip isn't enabled for ${name} (edit the style to turn it on)`, 'warning');
+            return;
+        }
+        openSuggestionsModal(category, timeSkipMode);
+    }
+
+    function openSuggestionsModal(category, timeSkip = false) {
         createSuggestionsModal();
 
         const allCategories = getAllCategories();
@@ -1855,14 +1911,16 @@ OUTPUT FORMAT: exactly one line and nothing else:
             catInfo = { name: 'Director Instructions', icon: 'fa-clapperboard' };
         }
 
-        jQuery('#pw_modal_title_text').text(catInfo?.name || 'Story Directions');
+        const title = catInfo?.name || 'Story Directions';
+        jQuery('#pw_modal_title_text').text(timeSkip ? `${title} · Time Skip` : title);
         jQuery('#pw_suggestions_modal .pw_modal_title i')
             .removeClass()
-            .addClass(`fa-solid ${catInfo?.icon || 'fa-compass'}`);
+            .addClass(`fa-solid ${timeSkip ? 'fa-hourglass-half' : (catInfo?.icon || 'fa-compass')}`);
 
         suggestionsModal.data('category', category);
+        suggestionsModal.data('timeSkip', timeSkip);
         suggestionsModal.addClass('active');
-        generateSuggestions(category);
+        generateSuggestions(category, false, null, 'single_scene', null, timeSkip);
     }
 
     function closeSuggestionsModal() {
@@ -2712,6 +2770,13 @@ Suggest developments that [describe the kind of turn you want]. Build them from 
                                             </div>
                                         </div>
                                     </div>
+                                    <div class="pw_editor_row">
+                                        <label for="pw_edit_timeskip">Time Skip</label>
+                                        <label class="pw_timeskip_check">
+                                            <input type="checkbox" id="pw_edit_timeskip">
+                                            <span>Time-skip variant <span class="pw_setting_tooltip_icon" title="Adds a time-skip version of this style. Turn on Time Skip (the hourglass in the Pathweaver bar) and click this style to get suggestions that jump ahead in time.">?</span></span>
+                                        </label>
+                                    </div>
                                     <div class="pw_editor_row" style="flex-direction: column; align-items: flex-start; flex: 1;">
                                         <label style="margin-bottom: 4px;">Style Prompt</label>
                                         <p class="pw_setting_hint" style="margin: 0 0 8px 0; padding-left: 0;">Describe only what this style should focus on. Pathweaver adds the shared rules and the output format automatically.</p>
@@ -3059,6 +3124,7 @@ Suggest developments that [describe the kind of turn you want]. Build them from 
             setIconDropdown('fa-star');
             promptArea.val(defaultTemplate);
             deleteBtn.hide();
+            jQuery('#pw_edit_timeskip').prop('checked', false);
         } else if (isBuiltin) {
             // Editing built-in style
             const allCats = getAllCategories();
@@ -3077,6 +3143,7 @@ Suggest developments that [describe the kind of turn you want]. Build them from 
             }
             promptArea.val(prompt);
             deleteBtn.hide();
+            jQuery('#pw_edit_timeskip').prop('checked', hasTimeSkipVariant(styleId));
         } else {
             // Editing custom style
             const style = settings.custom_styles.find(s => s.id === styleId);
@@ -3088,6 +3155,7 @@ Suggest developments that [describe the kind of turn you want]. Build them from 
             setIconDropdown(style.icon || 'fa-star');
             promptArea.val(style.prompt);
             deleteBtn.show();
+            jQuery('#pw_edit_timeskip').prop('checked', hasTimeSkipVariant(styleId));
         }
 
         flipper.addClass('flipped');
@@ -3098,6 +3166,7 @@ Suggest developments that [describe the kind of turn you want]. Build them from 
         // Read icon from our custom dropdown (hidden select is kept in sync)
         const icon = jQuery('#pw_edit_icon').val() || jQuery('#pw_icon_dropdown').data('value') || 'fa-star';
         const prompt = jQuery('#pw_edit_prompt').val().trim();
+        const timeSkipEnabled = jQuery('#pw_edit_timeskip').prop('checked');
 
         if (!currentEditStyle) return;
 
@@ -3117,6 +3186,7 @@ Suggest developments that [describe the kind of turn you want]. Build them from 
                 delete settings.builtin_icon_customizations[currentEditStyle.id];
             }
 
+            setTimeSkipVariant(currentEditStyle.id, timeSkipEnabled);
             saveSettings();
             showToast('Built-in style customized!');
         } else {
@@ -3137,6 +3207,7 @@ Suggest developments that [describe the kind of turn you want]. Build them from 
             }
 
             delete promptCache[id];
+            setTimeSkipVariant(id, timeSkipEnabled);
             saveSettings();
             showToast('Style saved!');
         }
@@ -3147,10 +3218,18 @@ Suggest developments that [describe the kind of turn you want]. Build them from 
         currentEditStyle = null;
     }
 
+    function setTimeSkipVariant(styleId, enabled) {
+        const ids = (settings.time_skip_styles || []).filter(id => id !== styleId);
+        if (enabled) ids.push(styleId);
+        settings.time_skip_styles = ids;
+    }
+
     function deleteStyle(styleId) {
         settings.custom_styles = settings.custom_styles.filter(s => s.id !== styleId);
+        setTimeSkipVariant(styleId, false);
         delete promptCache[styleId];
         delete cachedSuggestions[styleId];
+        delete cachedSuggestions[getSuggestionCacheKey(styleId, true)];
         saveSettings();
         createActionBar();
         renderStylesList();
@@ -4019,6 +4098,7 @@ Suggest developments that [describe the kind of turn you want]. Build them from 
 
     // Named handlers for cleanup
     const handleChatChanged = () => {
+        timeSkipMode = false;
         cachedSuggestions = {};
         cachedChatId = null;
         for (const s of activeSurprises) {
